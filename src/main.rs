@@ -6,6 +6,8 @@ mod gate;
 mod listen;
 mod recorder;
 mod sdr;
+#[cfg(test)]
+mod testsig;
 mod wavio;
 
 use std::path::PathBuf;
@@ -119,13 +121,27 @@ fn run_clean(
     if let Some(vad) = stats.mean_vad() {
         println!("voice : mean RNNoise voice probability {vad:.2}");
     }
+    let voiced_flux: Vec<f32> = stats
+        .vad
+        .iter()
+        .zip(&stats.flux)
+        .filter(|(v, _)| **v >= 0.5)
+        .map(|(_, f)| *f)
+        .collect();
+    if !voiced_flux.is_empty() {
+        println!(
+            "        mean spectral change over voiced frames {:.2}",
+            voiced_flux.iter().sum::<f32>() / voiced_flux.len() as f32
+        );
+    }
     if vad_report {
-        println!("voice probability per 0.25 s:");
-        for (i, chunk) in stats.vad.chunks(25).enumerate() {
-            let mean = chunk.iter().sum::<f32>() / chunk.len() as f32;
-            let max = chunk.iter().copied().fold(0.0, f32::max);
+        println!("per 0.25 s: voice probability (mean, max) and spectral change:");
+        for (i, (vad, flux)) in stats.vad.chunks(25).zip(stats.flux.chunks(25)).enumerate() {
+            let mean = vad.iter().sum::<f32>() / vad.len() as f32;
+            let max = vad.iter().copied().fold(0.0, f32::max);
+            let change = flux.iter().sum::<f32>() / flux.len() as f32;
             println!(
-                "  {:6.2}s  mean {mean:.2}  max {max:.2}  {}",
+                "  {:6.2}s  voice {mean:.2} max {max:.2}  change {change:.2}  {}",
                 i as f32 * 0.25,
                 "#".repeat((mean * 40.0).round() as usize)
             );

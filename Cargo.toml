@@ -1,0 +1,24 @@
+[package]
+name = "sdrfun"
+version = "0.1.0"
+edition = "2024"
+description = "Listen to AM airband voice on an RTL-SDR, clean it up, play and record it"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kushaldas/sdrfun"
+readme = "README.md"
+keywords = ["sdr", "rtl-sdr", "airband", "radio", "denoise"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+cpal = "0.18.2"
+ctrlc = "3.5.2"
+hound = "3.5.1"
+nnnoiseless = "0.5.2"
+rustfft = "6.4.1"
+serde_json = "1.0.151"
+
+[build-dependencies]
+pkg-config = "0.3.34"
