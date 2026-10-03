@@ -5,6 +5,7 @@ mod dsp;
 mod gate;
 mod listen;
 mod recorder;
+mod scan;
 mod sdr;
 #[cfg(test)]
 mod testsig;
@@ -28,6 +29,8 @@ struct Cli {
 enum Command {
     /// Receive a frequency, clean the audio and record it
     Listen(listen::ListenArgs),
+    /// Survey several frequencies and report which carry voice
+    Scan(scan::ScanArgs),
     /// Run the voice cleanup chain over a WAV file
     Clean {
         /// Input WAV (any rate, mono or stereo)
@@ -57,6 +60,7 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Listen(args) => listen::run(args),
+        Command::Scan(args) => scan::run(args),
         Command::Clean {
             input,
             output,

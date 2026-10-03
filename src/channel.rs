@@ -1,8 +1,11 @@
 //! One AM channel: IQ → frequency shift → decimate to 48 kHz → channel filter →
-//! power measurement + envelope demodulation, emitted as 10 ms frames.
+//! power and carrier measurement + envelope demodulation, emitted as 10 ms frames.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use rustfft::num_complex::Complex32;
+use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
 use crate::clean::{FRAME, SAMPLE_RATE};
 use crate::dsp::fir::{Decimator, lowpass};
@@ -16,6 +19,62 @@ pub struct Frame {
     pub audio: [f32; FRAME],
     /// Mean channel power over the frame, dBFS.
     pub power_db: f32,
+    /// Carrier prominence, dB: spectral density at the channel centre over that at
+    /// the channel edges. About 0 for noise, well above 0 when a carrier is present.
+    pub carrier_db: f32,
+}
+
+/// Frames averaged for the carrier prominence.
+const PROMINENCE_FRAMES: usize = 3;
+
+/// Compares the channel's centre (where an AM carrier sits) with its edges (noise only).
+struct CarrierDetector {
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    buf: Vec<Complex32>,
+    center_bins: usize,
+    edge_bins: std::ops::RangeInclusive<usize>,
+    recent: VecDeque<f32>,
+}
+
+impl CarrierDetector {
+    fn new(bandwidth_hz: f32) -> Self {
+        let bin_hz = SAMPLE_RATE as f32 / FRAME as f32;
+        let half = bandwidth_hz / 2.0;
+        Self {
+            fft: FftPlanner::new().plan_fft_forward(FRAME),
+            window: (0..FRAME)
+                .map(|n| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / FRAME as f32).cos())
+                .collect(),
+            buf: Vec::with_capacity(FRAME),
+            // ±1 kHz (or less for narrow channels) around the carrier, which also
+            // tolerates transmitter frequency offsets.
+            center_bins: ((0.2 * half).min(1000.0) / bin_hz).round() as usize,
+            // The outer part of the flat passband: voice is mostly below it.
+            edge_bins: (0.62 * half / bin_hz).round() as usize..=(0.76 * half / bin_hz).round() as usize,
+            recent: VecDeque::with_capacity(PROMINENCE_FRAMES),
+        }
+    }
+
+    fn measure(&mut self, iq: &[Complex32]) -> f32 {
+        self.buf.clear();
+        self.buf.extend(iq.iter().zip(&self.window).map(|(z, w)| z * w));
+        self.fft.process(&mut self.buf);
+        let psd = |k: usize| self.buf[k].norm_sqr();
+        let n = FRAME;
+        let c = self.center_bins;
+        let center = (psd(0) + (1..=c).map(|k| psd(k) + psd(n - k)).sum::<f32>()) / (2 * c + 1) as f32;
+        let edges = self.edge_bins.clone();
+        let edge_count = 2 * edges.clone().count();
+        let edge = edges.map(|k| psd(k) + psd(n - k)).sum::<f32>() / edge_count as f32;
+
+        if self.recent.len() == PROMINENCE_FRAMES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(center / edge.max(1e-20));
+        let mean = self.recent.iter().sum::<f32>() / self.recent.len() as f32;
+        10.0 * mean.max(1e-6).log10()
+    }
 }
 
 pub struct Channel {
@@ -27,13 +86,15 @@ pub struct Channel {
     carrier_alpha: f32,
     scratch: [Vec<Complex32>; 2],
     audio: Vec<f32>,
+    iq: Vec<Complex32>,
     power_sum: f32,
+    detector: CarrierDetector,
 }
 
 impl Channel {
     /// `offset_hz` is the target frequency relative to the tuner centre.
     pub fn new(sample_rate: u32, offset_hz: f64, bandwidth_hz: f32) -> Result<Self> {
-        if sample_rate % SAMPLE_RATE != 0 {
+        if !sample_rate.is_multiple_of(SAMPLE_RATE) {
             bail!("sample rate {sample_rate} must be a multiple of {SAMPLE_RATE}");
         }
         if !(1000.0..=40_000.0).contains(&bandwidth_hz) {
@@ -72,7 +133,9 @@ impl Channel {
             carrier_alpha: 1.0 - (-1.0 / (SAMPLE_RATE as f32 * CARRIER_TAU_S)).exp(),
             scratch: [Vec::new(), Vec::new()],
             audio: Vec::with_capacity(FRAME),
+            iq: Vec::with_capacity(FRAME),
             power_sum: 0.0,
+            detector: CarrierDetector::new(bandwidth_hz),
         })
     }
 
@@ -105,6 +168,7 @@ impl Channel {
             }
             self.carrier += (env - self.carrier) * self.carrier_alpha;
             self.audio.push(0.5 * (env / self.carrier.max(1e-9) - 1.0));
+            self.iq.push(z);
             self.power_sum += power;
             if self.audio.len() == FRAME {
                 let mut audio = [0.0; FRAME];
@@ -112,7 +176,9 @@ impl Channel {
                 self.audio.clear();
                 let power_db = 10.0 * (self.power_sum / FRAME as f32).max(1e-12).log10();
                 self.power_sum = 0.0;
-                frames.push(Frame { audio, power_db });
+                let carrier_db = self.detector.measure(&self.iq);
+                self.iq.clear();
+                frames.push(Frame { audio, power_db, carrier_db });
             }
         }
     }
@@ -123,7 +189,7 @@ fn split_decimation(mut total: u32) -> Result<Vec<u32>> {
     let original = total;
     let mut factors = Vec::new();
     while total > 1 {
-        let Some(d) = (2..=10).rev().find(|d| total % d == 0) else {
+        let Some(d) = (2..=10).rev().find(|&d| total.is_multiple_of(d)) else {
             bail!("cannot decimate by {original}: pick a sample rate of 48 kHz × (product of factors ≤ 10)");
         };
         factors.push(d);
@@ -174,6 +240,37 @@ mod tests {
         // Carrier power: amp² × (1 + depth²/2) ≈ 0.09 × 1.32 → about -9.2 dBFS.
         let p = frames[20].power_db;
         assert!((p + 9.2).abs() < 1.0, "power {p}");
+    }
+
+    /// u8 IQ of white noise only.
+    fn noise_iq(seconds: f64, fs: u32) -> Vec<u8> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..(2.0 * seconds * fs as f64) as usize)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Sum of 4 uniform bytes-ish: roughly Gaussian, ±~8 LSB.
+                let v: i32 = (0..4).map(|i| ((state >> (i * 8)) & 7) as i32).sum::<i32>() - 14;
+                (127 + v) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn carrier_prominence_separates_noise_and_carrier() {
+        let fs = 2_400_000;
+        let mut ch = Channel::new(fs, 250_000.0, 10_000.0).unwrap();
+        let mut frames = Vec::new();
+        ch.process_u8(&noise_iq(0.5, fs), &mut frames);
+        let noise: Vec<f32> = frames[5..].iter().map(|f| f.carrier_db).collect();
+        let worst = noise.iter().copied().fold(f32::MIN, f32::max);
+        assert!(worst < 4.0, "noise prominence up to {worst} dB");
+
+        let mut ch = Channel::new(fs, 250_000.0, 10_000.0).unwrap();
+        let mut frames = Vec::new();
+        ch.process_u8(&am_iq(fs, 250_000.0, 0.8, 0.3, 0.3), &mut frames);
+        assert!(frames[10].carrier_db > 20.0, "carrier prominence {}", frames[10].carrier_db);
     }
 
     #[test]

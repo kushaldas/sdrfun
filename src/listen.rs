@@ -16,7 +16,7 @@ use crate::channel::{Channel, Frame};
 use crate::clean::{CleanChain, CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{Gate, GateConfig, GateEvent, Transmission, Verdict};
 use crate::recorder::{StreamWriter, TransmissionLog, recording_path};
-use crate::sdr::{Device, Gain};
+use crate::sdr::{Block, Device, Gain};
 
 /// Frames between status-line refreshes (0.5 s).
 const STATUS_FRAMES: usize = 50;
@@ -118,22 +118,14 @@ pub fn run(args: ListenArgs) -> Result<()> {
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
             .context("installing Ctrl-C handler")?;
     }
-    let (tx, rx) = sync_channel::<Vec<u8>>(64);
+    let (tx, rx) = sync_channel::<Block>(64);
     let reader = {
         let stop = stop.clone();
-        thread::spawn(move || dev.stream(tx, stop))
+        thread::spawn(move || dev.stream(tx, stop, None))
     };
 
     let start = Utc::now();
-    let mut session = Session {
-        freq_mhz: args.freq,
-        start,
-        out_dir: args.out_dir.clone(),
-        save_raw: args.save_raw,
-        log: TransmissionLog::open(&args.out_dir.join("log.jsonl"))?,
-        kept: 0,
-        dropped: 0,
-    };
+    let mut session = Session::new(args.out_dir.clone(), args.save_raw)?;
     let mut continuous = args
         .continuous
         .then(|| -> Result<_> {
@@ -153,7 +145,7 @@ pub fn run(args: ListenArgs) -> Result<()> {
     let mut total_frames = 0u64;
 
     'outer: for block in rx {
-        for p in receiver.process(&block) {
+        for p in receiver.process(&block.data) {
             if let Some((clean_out, raw_out)) = &mut continuous {
                 clean_out.write(&p.clean)?;
                 if let Some(raw_out) = raw_out {
@@ -167,7 +159,9 @@ pub fn run(args: ListenArgs) -> Result<()> {
                     }
                     status.force = true;
                 }
-                Some(GateEvent::Closed(tx)) => session.finish(tx)?,
+                Some(GateEvent::Closed(tx)) => {
+                    session.finish(args.freq, start, tx)?;
+                }
                 None if p.gate_open => {
                     if let Some(s) = &mut speaker {
                         s.play(&p.clean);
@@ -197,7 +191,7 @@ pub fn run(args: ListenArgs) -> Result<()> {
         .join()
         .map_err(|_| anyhow!("SDR reader thread panicked"))??;
     if let Some(tx) = receiver.gate.flush() {
-        session.finish(tx)?;
+        session.finish(args.freq, start, tx)?;
     }
     eprintln!("\r\x1b[Kdone: {} transmission(s) saved, {} dropped", session.kept, session.dropped);
     if let Some((clean_out, raw_out)) = continuous {
@@ -242,6 +236,8 @@ pub struct Processed {
     pub raw: [f32; FRAME],
     pub clean: [f32; FRAME],
     pub power_db: f32,
+    /// Carrier prominence, dB (see `channel::Frame`).
+    pub carrier_db: f32,
     pub event: Option<GateEvent>,
     /// Whether the gate was open after this frame.
     pub gate_open: bool,
@@ -277,11 +273,12 @@ impl Receiver {
             .map(|frame| {
                 let mut clean = frame.audio;
                 let info = self.chain.process_frame(&mut clean);
-                let event = self.gate.push(frame.power_db, info, &frame.audio, &clean);
+                let event = self.gate.push(frame.power_db, frame.carrier_db, info, &frame.audio, &clean);
                 Processed {
                     raw: frame.audio,
                     clean,
                     power_db: frame.power_db,
+                    carrier_db: frame.carrier_db,
                     event,
                     gate_open: self.gate.is_open(),
                 }
@@ -290,31 +287,41 @@ impl Receiver {
     }
 }
 
-struct Session {
-    freq_mhz: f64,
-    start: DateTime<Utc>,
+/// Saves finished transmissions and keeps the log, for one or more receivers.
+pub struct Session {
     out_dir: PathBuf,
     save_raw: bool,
     log: TransmissionLog,
-    kept: u32,
-    dropped: u32,
+    pub kept: u32,
+    pub dropped: u32,
 }
 
 impl Session {
-    /// Save (or drop) a finished transmission and log it.
-    fn finish(&mut self, tx: Transmission) -> Result<()> {
-        let started = self.start + TimeDelta::milliseconds((tx.start_frame * 10) as i64);
+    pub fn new(out_dir: PathBuf, save_raw: bool) -> Result<Self> {
+        Ok(Self {
+            log: TransmissionLog::open(&out_dir.join("log.jsonl"))?,
+            out_dir,
+            save_raw,
+            kept: 0,
+            dropped: 0,
+        })
+    }
+
+    /// Save (or drop) a finished transmission on `freq_mhz` and log it. `start` is when
+    /// the receiver that produced it saw its first frame.
+    pub fn finish(&mut self, freq_mhz: f64, start: DateTime<Utc>, tx: Transmission) -> Result<Verdict> {
+        let started = start + TimeDelta::milliseconds((tx.start_frame * 10) as i64);
         let seconds = tx.seconds();
         let snr = tx.peak_db - tx.floor_db;
         let mut file = None;
         if tx.verdict == Verdict::Kept {
             let tag = format!("{:03}s", seconds.round() as u32);
-            let path = recording_path(&self.out_dir, self.freq_mhz, started, &tag);
+            let path = recording_path(&self.out_dir, freq_mhz, started, &tag);
             let mut w = StreamWriter::create(path)?;
             w.write(&tx.clean)?;
             file = Some(w.finish()?);
             if self.save_raw {
-                let raw_path = recording_path(&self.out_dir, self.freq_mhz, started, &format!("{tag}_raw"));
+                let raw_path = recording_path(&self.out_dir, freq_mhz, started, &format!("{tag}_raw"));
                 let mut w = StreamWriter::create(raw_path)?;
                 w.write(&tx.raw)?;
                 w.finish()?;
@@ -323,7 +330,7 @@ impl Session {
         } else {
             self.dropped += 1;
         }
-        self.log.append(self.freq_mhz, started, &tx, file.as_deref())?;
+        self.log.append(freq_mhz, started, &tx, file.as_deref())?;
 
         let what = match (tx.verdict, &file) {
             (Verdict::Kept, Some(p)) => format!("saved {}", p.display()),
@@ -332,13 +339,13 @@ impl Session {
             _ => "dropped (no voice)".to_string(),
         };
         eprintln!(
-            "\r\x1b[K{}  {seconds:5.1} s  peak {:6.1} dBFS  snr {snr:5.1} dB  voice {:3.0}%  change {:.2}  {what}",
+            "\r\x1b[K{}  {freq_mhz:.3}  {seconds:5.1} s  peak {:6.1} dBFS  snr {snr:5.1} dB  voice {:3.0}%  change {:.2}  {what}",
             started.format("%H:%M:%SZ"),
             tx.peak_db,
             tx.voiced_ratio * 100.0,
             tx.spectral_change,
         );
-        Ok(())
+        Ok(tx.verdict)
     }
 }
 
@@ -463,6 +470,19 @@ mod tests {
         assert!(t.peak_db - t.floor_db > 20.0, "snr {}", t.peak_db - t.floor_db);
         assert!(t.voiced_ratio > 0.5, "voiced {}", t.voiced_ratio);
         eprintln!("speech: voiced {:.2} change {:.2}", t.voiced_ratio, t.spectral_change);
+    }
+
+    #[test]
+    fn records_transmission_already_on_at_start() {
+        let fs = 240_000;
+        let speech: Vec<f32> = speech(fs, 5.0).iter().map(|x| x * 2.0).collect();
+        let closed = receive(fs, -50_000.0, &synth_iq(fs, -50_000.0, 0.0, 3.0, &speech));
+        assert_eq!(closed.len(), 1);
+        let t = &closed[0];
+        assert_eq!(t.verdict, Verdict::Kept);
+        assert_eq!(t.start_frame, 0);
+        assert!((t.carrier_s - 5.0).abs() < 0.1, "carrier {}", t.carrier_s);
+        assert!(t.floor_db.is_finite(), "floor learned after the carrier dropped");
     }
 
     #[test]

@@ -176,6 +176,6 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
         assert!(diff < 1e-4, "streaming diverged by {diff}");
-        assert!((rms(&one_shot[1000..9000]) - 0.7071).abs() < 0.01);
+        assert!((rms(&one_shot[1000..9000]) - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
     }
 }
