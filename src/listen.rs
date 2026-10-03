@@ -276,8 +276,8 @@ impl Receiver {
             .iter()
             .map(|frame| {
                 let mut clean = frame.audio;
-                let vad = self.chain.process_frame(&mut clean);
-                let event = self.gate.push(frame.power_db, vad, &frame.audio, &clean);
+                let info = self.chain.process_frame(&mut clean);
+                let event = self.gate.push(frame.power_db, info, &frame.audio, &clean);
                 Processed {
                     raw: frame.audio,
                     clean,
@@ -328,13 +328,15 @@ impl Session {
         let what = match (tx.verdict, &file) {
             (Verdict::Kept, Some(p)) => format!("saved {}", p.display()),
             (Verdict::TooShort, _) => "dropped (too short)".to_string(),
+            (Verdict::SteadyTone, _) => "dropped (steady tone)".to_string(),
             _ => "dropped (no voice)".to_string(),
         };
         eprintln!(
-            "\r\x1b[K{}  {seconds:5.1} s  peak {:6.1} dBFS  snr {snr:5.1} dB  voice {:3.0}%  {what}",
+            "\r\x1b[K{}  {seconds:5.1} s  peak {:6.1} dBFS  snr {snr:5.1} dB  voice {:3.0}%  change {:.2}  {what}",
             started.format("%H:%M:%SZ"),
             tx.peak_db,
             tx.voiced_ratio * 100.0,
+            tx.spectral_change,
         );
         Ok(())
     }
@@ -380,7 +382,7 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::resample::resample_all;
+    use crate::testsig::speech;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -408,22 +410,16 @@ mod tests {
         }
     }
 
-    /// Recorded airband voice AM-modulated onto a carrier at `offset` Hz, with
-    /// `lead`/`trail` seconds of carrier-less noise around it, as u8 IQ at `fs`.
-    fn synth_iq(fs: u32, offset: f64, lead: f64, trail: f64) -> (Vec<u8>, f64) {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/airband_voice_16k.wav");
-        let (voice, rate) = crate::wavio::read_mono(std::path::Path::new(path)).unwrap();
-        let peak = voice.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-        let voice = resample_all(&voice, rate, fs);
-        let voice_s = voice.len() as f64 / fs as f64;
-
+    /// `modulation` (at `fs`, peaking near ±1) AM-modulated at 80 % onto a carrier at
+    /// `offset` Hz, with `lead`/`trail` seconds of carrier-less noise around it, as u8 IQ.
+    fn synth_iq(fs: u32, offset: f64, lead: f64, trail: f64, modulation: &[f32]) -> Vec<u8> {
         let mut noise = Noise(0x9E37_79B9_7F4A_7C15);
         let (lead_n, trail_n) = ((lead * fs as f64) as usize, (trail * fs as f64) as usize);
-        let total = lead_n + voice.len() + trail_n;
+        let total = lead_n + modulation.len() + trail_n;
         let mut iq = Vec::with_capacity(2 * total);
         for i in 0..total {
             let carrier = match i.checked_sub(lead_n) {
-                Some(j) if j < voice.len() => 0.1 * (1.0 + 0.8 * (voice[j] / peak) as f64),
+                Some(j) if j < modulation.len() => 0.1 * (1.0 + 0.8 * modulation[j] as f64),
                 _ => 0.0,
             };
             let ph = 2.0 * std::f64::consts::PI * offset * i as f64 / fs as f64;
@@ -431,17 +427,14 @@ mod tests {
                 iq.push((127.4 + v * 128.0).round().clamp(0.0, 255.0) as u8);
             }
         }
-        (iq, voice_s)
+        iq
     }
 
-    #[test]
-    fn records_one_voice_transmission_from_iq() {
-        let fs = 240_000;
-        let (iq, voice_s) = synth_iq(fs, -50_000.0, 2.0, 3.0);
+    /// Run IQ through a default receiver; return the closed transmissions.
+    fn receive(fs: u32, offset: f64, iq: &[u8]) -> Vec<Transmission> {
         let args = Wrapper::parse_from(["x"]);
-        let channel = Channel::new(fs, -50_000.0, 10_000.0).unwrap();
+        let channel = Channel::new(fs, offset, 10_000.0).unwrap();
         let mut rx = Receiver::new(channel, &args.clean, args.gate);
-
         let mut closed = Vec::new();
         for block in iq.chunks(2 * 12_000) {
             for p in rx.process(block) {
@@ -451,6 +444,16 @@ mod tests {
             }
         }
         assert!(rx.gate.flush().is_none(), "gate should have closed after the carrier");
+        closed
+    }
+
+    #[test]
+    fn records_one_voice_transmission_from_iq() {
+        let fs = 240_000;
+        let voice_s = 8.0;
+        let speech: Vec<f32> = speech(fs, voice_s).iter().map(|x| x * 2.0).collect();
+        let iq = synth_iq(fs, -50_000.0, 2.0, 3.0, &speech);
+        let closed = receive(fs, -50_000.0, &iq);
         assert_eq!(closed.len(), 1, "exactly one transmission");
         let t = &closed[0];
         assert_eq!(t.verdict, Verdict::Kept, "voiced ratio {}", t.voiced_ratio);
@@ -458,6 +461,29 @@ mod tests {
         let start_s = t.start_frame as f64 * FRAME as f64 / SAMPLE_RATE as f64;
         assert!((start_s - 1.7).abs() < 0.05, "start {start_s}");
         assert!(t.peak_db - t.floor_db > 20.0, "snr {}", t.peak_db - t.floor_db);
-        assert!(t.voiced_ratio > 0.2, "voiced {}", t.voiced_ratio);
+        assert!(t.voiced_ratio > 0.5, "voiced {}", t.voiced_ratio);
+        eprintln!("speech: voiced {:.2} change {:.2}", t.voiced_ratio, t.spectral_change);
+    }
+
+    #[test]
+    fn drops_unmodulated_carrier() {
+        let fs = 240_000;
+        let iq = synth_iq(fs, -50_000.0, 2.0, 3.0, &vec![0.0; fs as usize * 4]);
+        let closed = receive(fs, -50_000.0, &iq);
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].verdict, Verdict::NoVoice, "voiced {}", closed[0].voiced_ratio);
+    }
+
+    #[test]
+    fn drops_carrier_modulated_by_a_steady_tone() {
+        let fs = 240_000;
+        let tone: Vec<f32> = (0..fs as usize * 4)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / fs as f32).sin())
+            .collect();
+        let iq = synth_iq(fs, -50_000.0, 2.0, 3.0, &tone);
+        let closed = receive(fs, -50_000.0, &iq);
+        assert_eq!(closed.len(), 1);
+        eprintln!("tone: voiced {:.2} change {:.2}", closed[0].voiced_ratio, closed[0].spectral_change);
+        assert_eq!(closed[0].verdict, Verdict::SteadyTone, "change {}", closed[0].spectral_change);
     }
 }

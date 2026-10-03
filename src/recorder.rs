@@ -102,10 +102,12 @@ impl TransmissionLog {
             "floor_dbfs": round1(tx.floor_db),
             "snr_db": round1(tx.peak_db - tx.floor_db),
             "voiced_ratio": (tx.voiced_ratio * 100.0).round() / 100.0,
+            "spectral_change": (tx.spectral_change * 100.0).round() / 100.0,
             "verdict": match tx.verdict {
                 Verdict::Kept => "kept",
                 Verdict::TooShort => "too_short",
                 Verdict::NoVoice => "no_voice",
+                Verdict::SteadyTone => "steady_tone",
             },
             "file": file.map(|p| p.display().to_string()),
         });

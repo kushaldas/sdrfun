@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use clap::Args;
 
-use crate::clean::{FRAME, SAMPLE_RATE};
+use crate::clean::{FRAME, FrameInfo, SAMPLE_RATE};
 
 const FRAMES_PER_S: f32 = SAMPLE_RATE as f32 / FRAME as f32;
 /// The carrier must fall this far below the open threshold before hang time starts.
@@ -38,6 +38,10 @@ pub struct GateConfig {
     /// Keep a transmission only if at least this fraction of its carrier frames is speech
     #[arg(long, default_value_t = 0.1)]
     pub vad_ratio: f32,
+    /// Drop as a steady tone (e.g. ACARS data) if the mean spectral change over speech
+    /// frames is below this (0 = identical spectra, 2 = completely different)
+    #[arg(long, default_value_t = 0.25)]
+    pub min_spectral_change: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +49,7 @@ pub enum Verdict {
     Kept,
     TooShort,
     NoVoice,
+    SteadyTone,
 }
 
 pub struct Transmission {
@@ -54,6 +59,8 @@ pub struct Transmission {
     pub raw: Vec<f32>,
     pub carrier_s: f32,
     pub voiced_ratio: f32,
+    /// Mean spectral change over the voiced frames.
+    pub spectral_change: f32,
     pub peak_db: f32,
     pub floor_db: f32,
     pub verdict: Verdict,
@@ -75,6 +82,7 @@ struct Open {
     tx: Transmission,
     carrier_frames: u32,
     voiced_frames: u32,
+    voiced_flux: f32,
     hang_frames: u32,
     /// Audio length at the last frame that had carrier.
     carrier_end: usize,
@@ -116,11 +124,11 @@ impl Gate {
         self.open.is_some()
     }
 
-    /// Feed one frame: its channel power, voice probability, raw and cleaned audio.
+    /// Feed one frame: its channel power, what the cleanup chain measured, raw and cleaned audio.
     pub fn push(
         &mut self,
         power_db: f32,
-        vad: f32,
+        info: FrameInfo,
         raw: &[f32; FRAME],
         clean: &[f32; FRAME],
     ) -> Option<GateEvent> {
@@ -133,7 +141,8 @@ impl Gate {
             return None;
         };
         let open_at = floor + self.cfg.squelch_margin;
-        let voiced = u32::from(vad >= self.cfg.vad_threshold);
+        let voiced = u32::from(info.vad >= self.cfg.vad_threshold);
+        let flux = if voiced == 1 { info.flux } else { 0.0 };
 
         let Some(open) = &mut self.open else {
             if power_db > open_at {
@@ -143,6 +152,7 @@ impl Gate {
                     raw: Vec::new(),
                     carrier_s: 0.0,
                     voiced_ratio: 0.0,
+                    spectral_change: 0.0,
                     peak_db: power_db,
                     floor_db: floor,
                     verdict: Verdict::Kept,
@@ -158,6 +168,7 @@ impl Gate {
                     tx,
                     carrier_frames: 1,
                     voiced_frames: voiced,
+                    voiced_flux: flux,
                     hang_frames: 0,
                     carrier_end,
                 });
@@ -174,6 +185,7 @@ impl Gate {
         if power_db > open_at - HYSTERESIS_DB {
             open.carrier_frames += 1;
             open.voiced_frames += voiced;
+            open.voiced_flux += flux;
             open.hang_frames = 0;
             open.carrier_end = open.tx.clean.len();
             open.tx.peak_db = open.tx.peak_db.max(power_db);
@@ -198,10 +210,13 @@ impl Gate {
         tx.raw.truncate(keep);
         tx.carrier_s = open.carrier_frames as f32 / FRAMES_PER_S;
         tx.voiced_ratio = open.voiced_frames as f32 / open.carrier_frames as f32;
+        tx.spectral_change = open.voiced_flux / open.voiced_frames.max(1) as f32;
         tx.verdict = if tx.carrier_s < self.cfg.min_duration {
             Verdict::TooShort
         } else if tx.voiced_ratio < self.cfg.vad_ratio {
             Verdict::NoVoice
+        } else if tx.spectral_change < self.cfg.min_spectral_change {
+            Verdict::SteadyTone
         } else {
             Verdict::Kept
         };
@@ -240,11 +255,16 @@ mod tests {
         Gate::new(Wrapper::parse_from(["x"]).cfg)
     }
 
-    /// Feed `n` frames at `power` dB with voice probability `vad`; collect events.
+    /// Feed `n` frames at `power` dB with voice probability `vad` and speech-like
+    /// spectral change; collect events.
     fn feed(g: &mut Gate, n: usize, power: f32, vad: f32, events: &mut Vec<GateEvent>) {
+        feed_flux(g, n, power, vad, 1.0, events);
+    }
+
+    fn feed_flux(g: &mut Gate, n: usize, power: f32, vad: f32, flux: f32, events: &mut Vec<GateEvent>) {
         let silence = [0.0; FRAME];
         for _ in 0..n {
-            events.extend(g.push(power, vad, &silence, &silence));
+            events.extend(g.push(power, FrameInfo { vad, flux }, &silence, &silence));
         }
     }
 
@@ -293,6 +313,18 @@ mod tests {
         let txs = closed(ev);
         assert_eq!(txs.len(), 1);
         assert_eq!(txs[0].verdict, Verdict::NoVoice);
+    }
+
+    #[test]
+    fn voiced_but_steady_spectrum_is_dropped_as_tone() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        feed(&mut g, 300, -65.0, 0.02, &mut ev);
+        feed_flux(&mut g, 300, -45.0, 0.95, 0.05, &mut ev);
+        feed(&mut g, 200, -65.0, 0.02, &mut ev);
+        let txs = closed(ev);
+        assert_eq!(txs[0].verdict, Verdict::SteadyTone);
+        assert!((txs[0].spectral_change - 0.05).abs() < 0.01);
     }
 
     #[test]

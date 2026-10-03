@@ -2,6 +2,7 @@
 //! band-pass → denoiser (dry/wet mix) → speech AGC + limiter, at 48 kHz in 10 ms frames.
 
 mod agc;
+mod flux;
 mod rnnoise;
 mod spectral;
 
@@ -69,6 +70,17 @@ pub struct CleanConfig {
 pub struct ChainStats {
     /// RNNoise voice probability of every processed frame.
     pub vad: Vec<f32>,
+    /// Spectral shape change of every processed frame.
+    pub flux: Vec<f32>,
+}
+
+/// What the chain learned about one input frame.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameInfo {
+    /// RNNoise voice probability, 0..1.
+    pub vad: f32,
+    /// Spectral shape change against 50 ms earlier, 0..2.
+    pub flux: f32,
 }
 
 impl ChainStats {
@@ -83,6 +95,7 @@ pub struct CleanChain {
     denoiser: Box<dyn Denoiser>,
     /// Detection-only RNNoise, used when the denoiser does not report voice probability.
     side_vad: Option<rnnoise::RnNoise>,
+    flux: flux::SpectralFlux,
     mix: f32,
     dry_delay: VecDeque<f32>,
     agc: Option<agc::Agc>,
@@ -103,6 +116,7 @@ impl CleanChain {
         Self {
             bandpass: Cascade::bandpass(SAMPLE_RATE as f32, edge(cfg.highpass), edge(cfg.lowpass)),
             side_vad: (cfg.denoiser != DenoiserKind::Rnnoise).then(rnnoise::RnNoise::new),
+            flux: flux::SpectralFlux::new(),
             denoiser,
             mix: cfg.denoise_mix.clamp(0.0, 1.0),
             dry_delay,
@@ -142,10 +156,11 @@ impl CleanChain {
         }
     }
 
-    /// Clean one frame in place (output delayed by `latency()`); returns the
-    /// voice probability of the input frame.
-    pub fn process_frame(&mut self, frame: &mut [f32; FRAME]) -> f32 {
+    /// Clean one frame in place (output delayed by `latency()`); returns what was
+    /// measured on the input frame.
+    pub fn process_frame(&mut self, frame: &mut [f32; FRAME]) -> FrameInfo {
         self.bandpass.process_in_place(frame);
+        let flux = self.flux.process(frame);
 
         let mut probe = self.side_vad.is_some().then(|| *frame);
         let dry = (self.mix < 1.0).then(|| *frame);
@@ -156,6 +171,7 @@ impl CleanChain {
         let vad = vad.unwrap_or(0.0);
         if self.keep_trace {
             self.stats.vad.push(vad);
+            self.stats.flux.push(flux);
         }
 
         if let Some(dry) = dry {
@@ -169,7 +185,7 @@ impl CleanChain {
         if let Some(agc) = &mut self.agc {
             agc.process_frame(frame);
         }
-        vad
+        FrameInfo { vad, flux }
     }
 }
 
@@ -184,6 +200,7 @@ pub fn clean_all(input: &[f32], cfg: &CleanConfig) -> (Vec<f32>, ChainStats) {
     out.drain(..latency.min(out.len()));
     out.truncate(input.len());
     chain.stats.vad.truncate(input.len().div_ceil(FRAME));
+    chain.stats.flux.truncate(input.len().div_ceil(FRAME));
     (out, chain.stats)
 }
 
