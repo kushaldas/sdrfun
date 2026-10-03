@@ -1,0 +1,346 @@
+//! Transmission gate: carrier squelch against an auto-tracked noise floor, with
+//! pre-roll, hang time and RNNoise voice confirmation. Works on 10 ms frames.
+
+use std::collections::VecDeque;
+
+use clap::Args;
+
+use crate::clean::{FRAME, SAMPLE_RATE};
+
+const FRAMES_PER_S: f32 = SAMPLE_RATE as f32 / FRAME as f32;
+/// The carrier must fall this far below the open threshold before hang time starts.
+const HYSTERESIS_DB: f32 = 3.0;
+/// Audio kept after the carrier drops (the rest of the hang time is trimmed).
+const TAIL_S: f32 = 0.3;
+/// Noise floor tracking per frame: falls quickly (~0.2 s), rises slowly (~10 s) while idle
+/// and very slowly (~5 min) during a transmission, so a stuck carrier is eventually absorbed.
+const FLOOR_FALL: f32 = 0.05;
+const FLOOR_RISE_IDLE: f32 = 0.001;
+const FLOOR_RISE_OPEN: f32 = 1.0 / 30_000.0;
+
+#[derive(Args, Clone, Debug)]
+pub struct GateConfig {
+    /// Open the gate when channel power is this many dB above the noise floor
+    #[arg(long, default_value_t = 8.0)]
+    pub squelch_margin: f32,
+    /// Seconds the gate stays open after the carrier drops
+    #[arg(long, default_value_t = 1.5)]
+    pub hang: f32,
+    /// Seconds of audio kept from before the gate opened
+    #[arg(long, default_value_t = 0.3)]
+    pub pre_roll: f32,
+    /// Drop transmissions whose carrier lasted less than this many seconds
+    #[arg(long, default_value_t = 0.5)]
+    pub min_duration: f32,
+    /// RNNoise voice probability above which a frame counts as speech
+    #[arg(long, default_value_t = 0.5)]
+    pub vad_threshold: f32,
+    /// Keep a transmission only if at least this fraction of its carrier frames is speech
+    #[arg(long, default_value_t = 0.1)]
+    pub vad_ratio: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Kept,
+    TooShort,
+    NoVoice,
+}
+
+pub struct Transmission {
+    /// Index of the first frame (including pre-roll) since the gate was created.
+    pub start_frame: u64,
+    pub clean: Vec<f32>,
+    pub raw: Vec<f32>,
+    pub carrier_s: f32,
+    pub voiced_ratio: f32,
+    pub peak_db: f32,
+    pub floor_db: f32,
+    pub verdict: Verdict,
+}
+
+impl Transmission {
+    pub fn seconds(&self) -> f32 {
+        self.clean.len() as f32 / SAMPLE_RATE as f32
+    }
+}
+
+pub enum GateEvent {
+    /// The gate opened; carries the cleaned audio so far (pre-roll + this frame).
+    Opened(Vec<f32>),
+    Closed(Transmission),
+}
+
+struct Open {
+    tx: Transmission,
+    carrier_frames: u32,
+    voiced_frames: u32,
+    hang_frames: u32,
+    /// Audio length at the last frame that had carrier.
+    carrier_end: usize,
+}
+
+pub struct Gate {
+    cfg: GateConfig,
+    hang_frames: u32,
+    pre_roll_frames: usize,
+    floor: Option<f32>,
+    pre_roll: VecDeque<([f32; FRAME], [f32; FRAME])>,
+    open: Option<Open>,
+    frame_index: u64,
+}
+
+impl Gate {
+    pub fn new(cfg: GateConfig) -> Self {
+        Self {
+            hang_frames: (cfg.hang * FRAMES_PER_S).round().max(1.0) as u32,
+            pre_roll_frames: (cfg.pre_roll * FRAMES_PER_S).round() as usize,
+            cfg,
+            floor: None,
+            pre_roll: VecDeque::new(),
+            open: None,
+            frame_index: 0,
+        }
+    }
+
+    pub fn floor_db(&self) -> Option<f32> {
+        self.floor
+    }
+
+    /// Seconds of audio in the transmission currently being received.
+    pub fn open_seconds(&self) -> Option<f32> {
+        self.open.as_ref().map(|o| o.tx.seconds())
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// Feed one frame: its channel power, voice probability, raw and cleaned audio.
+    pub fn push(
+        &mut self,
+        power_db: f32,
+        vad: f32,
+        raw: &[f32; FRAME],
+        clean: &[f32; FRAME],
+    ) -> Option<GateEvent> {
+        let index = self.frame_index;
+        self.frame_index += 1;
+
+        let Some(floor) = self.floor else {
+            self.floor = Some(power_db);
+            self.remember(raw, clean);
+            return None;
+        };
+        let open_at = floor + self.cfg.squelch_margin;
+        let voiced = u32::from(vad >= self.cfg.vad_threshold);
+
+        let Some(open) = &mut self.open else {
+            if power_db > open_at {
+                let mut tx = Transmission {
+                    start_frame: index - self.pre_roll.len() as u64,
+                    clean: Vec::new(),
+                    raw: Vec::new(),
+                    carrier_s: 0.0,
+                    voiced_ratio: 0.0,
+                    peak_db: power_db,
+                    floor_db: floor,
+                    verdict: Verdict::Kept,
+                };
+                for (r, c) in self.pre_roll.drain(..) {
+                    tx.raw.extend_from_slice(&r);
+                    tx.clean.extend_from_slice(&c);
+                }
+                tx.raw.extend_from_slice(raw);
+                tx.clean.extend_from_slice(clean);
+                let carrier_end = tx.clean.len();
+                self.open = Some(Open {
+                    tx,
+                    carrier_frames: 1,
+                    voiced_frames: voiced,
+                    hang_frames: 0,
+                    carrier_end,
+                });
+                let so_far = self.open.as_ref().map(|o| o.tx.clean.clone()).unwrap_or_default();
+                return Some(GateEvent::Opened(so_far));
+            }
+            self.track_floor(power_db, if power_db < floor { FLOOR_FALL } else { FLOOR_RISE_IDLE });
+            self.remember(raw, clean);
+            return None;
+        };
+
+        open.tx.raw.extend_from_slice(raw);
+        open.tx.clean.extend_from_slice(clean);
+        if power_db > open_at - HYSTERESIS_DB {
+            open.carrier_frames += 1;
+            open.voiced_frames += voiced;
+            open.hang_frames = 0;
+            open.carrier_end = open.tx.clean.len();
+            open.tx.peak_db = open.tx.peak_db.max(power_db);
+        } else {
+            open.hang_frames += 1;
+        }
+        let done = open.hang_frames >= self.hang_frames;
+        self.track_floor(power_db, if power_db < floor { FLOOR_FALL } else { FLOOR_RISE_OPEN });
+        done.then(|| GateEvent::Closed(self.close()))
+    }
+
+    /// Close any transmission in progress (e.g. on shutdown).
+    pub fn flush(&mut self) -> Option<Transmission> {
+        self.open.is_some().then(|| self.close())
+    }
+
+    fn close(&mut self) -> Transmission {
+        let open = self.open.take().expect("gate is open");
+        let mut tx = open.tx;
+        let keep = (open.carrier_end + (TAIL_S * SAMPLE_RATE as f32) as usize).min(tx.clean.len());
+        tx.clean.truncate(keep);
+        tx.raw.truncate(keep);
+        tx.carrier_s = open.carrier_frames as f32 / FRAMES_PER_S;
+        tx.voiced_ratio = open.voiced_frames as f32 / open.carrier_frames as f32;
+        tx.verdict = if tx.carrier_s < self.cfg.min_duration {
+            Verdict::TooShort
+        } else if tx.voiced_ratio < self.cfg.vad_ratio {
+            Verdict::NoVoice
+        } else {
+            Verdict::Kept
+        };
+        tx
+    }
+
+    fn track_floor(&mut self, power_db: f32, rate: f32) {
+        if let Some(f) = &mut self.floor {
+            *f += (power_db - *f) * rate;
+        }
+    }
+
+    fn remember(&mut self, raw: &[f32; FRAME], clean: &[f32; FRAME]) {
+        if self.pre_roll_frames == 0 {
+            return;
+        }
+        if self.pre_roll.len() == self.pre_roll_frames {
+            self.pre_roll.pop_front();
+        }
+        self.pre_roll.push_back((*raw, *clean));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Wrapper {
+        #[command(flatten)]
+        cfg: GateConfig,
+    }
+
+    fn gate() -> Gate {
+        Gate::new(Wrapper::parse_from(["x"]).cfg)
+    }
+
+    /// Feed `n` frames at `power` dB with voice probability `vad`; collect events.
+    fn feed(g: &mut Gate, n: usize, power: f32, vad: f32, events: &mut Vec<GateEvent>) {
+        let silence = [0.0; FRAME];
+        for _ in 0..n {
+            events.extend(g.push(power, vad, &silence, &silence));
+        }
+    }
+
+    fn closed(events: Vec<GateEvent>) -> Vec<Transmission> {
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                GateEvent::Closed(t) => Some(t),
+                GateEvent::Opened(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn voice_transmission_is_kept_with_pre_roll_and_trimmed_tail() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        feed(&mut g, 500, -65.0, 0.02, &mut ev);
+        assert!(ev.is_empty());
+        feed(&mut g, 300, -45.0, 0.8, &mut ev); // 3 s of speech on a strong carrier
+        let GateEvent::Opened(so_far) = &ev[0] else { panic!("expected Opened") };
+        assert_eq!(so_far.len(), 31 * FRAME, "pre-roll plus the opening frame");
+        assert!(g.is_open());
+        feed(&mut g, 200, -65.0, 0.02, &mut ev);
+        assert!(!g.is_open());
+
+        let txs = closed(ev);
+        assert_eq!(txs.len(), 1);
+        let t = &txs[0];
+        assert_eq!(t.verdict, Verdict::Kept);
+        assert_eq!(t.start_frame, 500 - 30);
+        assert!((t.carrier_s - 3.0).abs() < 0.02);
+        // 0.3 s pre-roll + 3 s carrier + 0.3 s tail.
+        assert!((t.seconds() - 3.6).abs() < 0.02, "{}", t.seconds());
+        assert!((t.floor_db + 65.0).abs() < 0.5);
+        assert_eq!(t.peak_db, -45.0);
+    }
+
+    #[test]
+    fn carrier_without_voice_is_dropped() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        feed(&mut g, 300, -65.0, 0.02, &mut ev);
+        feed(&mut g, 200, -45.0, 0.05, &mut ev);
+        feed(&mut g, 200, -65.0, 0.02, &mut ev);
+        let txs = closed(ev);
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0].verdict, Verdict::NoVoice);
+    }
+
+    #[test]
+    fn short_click_is_dropped() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        feed(&mut g, 300, -65.0, 0.02, &mut ev);
+        feed(&mut g, 20, -45.0, 0.9, &mut ev);
+        feed(&mut g, 200, -65.0, 0.02, &mut ev);
+        assert_eq!(closed(ev)[0].verdict, Verdict::TooShort);
+    }
+
+    #[test]
+    fn short_fades_inside_hang_time_do_not_split_a_transmission() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        feed(&mut g, 300, -65.0, 0.02, &mut ev);
+        for _ in 0..3 {
+            feed(&mut g, 100, -45.0, 0.8, &mut ev);
+            feed(&mut g, 50, -66.0, 0.0, &mut ev); // 0.5 s gap < 1.5 s hang
+        }
+        feed(&mut g, 300, -65.0, 0.02, &mut ev);
+        let txs = closed(ev);
+        assert_eq!(txs.len(), 1);
+        assert!((txs[0].carrier_s - 3.0).abs() < 0.02);
+    }
+
+    #[test]
+    fn noise_below_margin_never_opens() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        for i in 0..2000 {
+            let wobble = if i % 2 == 0 { 3.0 } else { -3.0 };
+            feed(&mut g, 1, -65.0 + wobble, 0.3, &mut ev);
+        }
+        assert!(ev.is_empty());
+        let floor = g.floor_db().unwrap();
+        assert!((-69.0..-62.0).contains(&floor), "floor {floor}");
+    }
+
+    #[test]
+    fn flush_closes_open_transmission() {
+        let mut g = gate();
+        let mut ev = Vec::new();
+        feed(&mut g, 100, -65.0, 0.0, &mut ev);
+        feed(&mut g, 100, -40.0, 0.9, &mut ev);
+        let t = g.flush().expect("open transmission");
+        assert_eq!(t.verdict, Verdict::Kept);
+        assert!(g.flush().is_none());
+    }
+}
