@@ -92,7 +92,12 @@ impl TransmissionLog {
         tx: &Transmission,
         file: Option<&Path>,
     ) -> Result<()> {
-        let round1 = |v: f32| (v * 10.0).round() / 10.0;
+        // Round in f64 so the JSON shows 7.1 rather than 7.099999904632568.
+        let round = |v: f32, places: i32| {
+            let scale = 10f64.powi(places);
+            (v as f64 * scale).round() / scale
+        };
+        let round1 = |v: f32| round(v, 1);
         let entry = serde_json::json!({
             "start": start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "freq_mhz": freq_mhz,
@@ -101,8 +106,8 @@ impl TransmissionLog {
             "peak_dbfs": round1(tx.peak_db),
             "floor_dbfs": round1(tx.floor_db),
             "snr_db": round1(tx.peak_db - tx.floor_db),
-            "voiced_ratio": (tx.voiced_ratio * 100.0).round() / 100.0,
-            "spectral_change": (tx.spectral_change * 100.0).round() / 100.0,
+            "voiced_ratio": round(tx.voiced_ratio, 2),
+            "spectral_change": round(tx.spectral_change, 2),
             "verdict": match tx.verdict {
                 Verdict::Kept => "kept",
                 Verdict::TooShort => "too_short",
@@ -128,6 +133,38 @@ pub fn recording_path(out_dir: &Path, freq_mhz: f64, start: DateTime<Utc>, tag: 
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn log_numbers_are_rounded_cleanly() {
+        let dir = std::env::temp_dir().join(format!("sdrfun-log-{}", std::process::id()));
+        let path = dir.join("log.jsonl");
+        let tx = Transmission {
+            start_frame: 0,
+            clean: vec![0.0; 417_600],
+            raw: Vec::new(),
+            carrier_s: 7.1,
+            voiced_ratio: 0.54,
+            spectral_change: 1.06,
+            peak_db: -45.5,
+            floor_db: -60.4,
+            verdict: Verdict::Kept,
+        };
+        let t = Utc.with_ymd_and_hms(2026, 10, 3, 20, 21, 56).unwrap();
+        TransmissionLog::open(&path).unwrap().append(120.15, t, &tx, None).unwrap();
+        let line = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        for want in [
+            r#""carrier_s":7.1"#,
+            r#""duration_s":8.7"#,
+            r#""floor_dbfs":-60.4"#,
+            r#""snr_db":14.9"#,
+            r#""voiced_ratio":0.54"#,
+            r#""spectral_change":1.06"#,
+        ] {
+            let found = [",", "}"].iter().any(|end| line.contains(&format!("{want}{end}")));
+            assert!(found, "{want} missing in {line}");
+        }
+    }
 
     #[test]
     fn path_layout() {

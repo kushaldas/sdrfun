@@ -105,7 +105,7 @@ where
 {
     let channels = config.channels as usize;
     let stream = dev.build_output_stream::<T, _, _>(
-        config.clone(),
+        *config,
         move |data: &mut [T], _| {
             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
             for frame in data.chunks_mut(channels) {

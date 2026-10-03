@@ -3,7 +3,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use anyhow::{Result, bail};
 
@@ -35,6 +35,12 @@ unsafe extern "C" {
 
 /// Bytes per synchronous read: 128 Ki IQ pairs, ~55 ms at 2.4 MS/s.
 const READ_LEN: usize = 16 * 16384;
+
+/// A block of raw IQ, tagged with the tuner frequency it was captured at.
+pub struct Block {
+    pub center_hz: u32,
+    pub data: Vec<u8>,
+}
 
 pub struct DeviceInfo {
     pub index: u32,
@@ -188,23 +194,40 @@ impl Device {
         v
     }
 
-    /// Read IQ blocks until `stop` is set or the receiver hangs up.
-    pub fn stream(mut self, tx: SyncSender<Vec<u8>>, stop: Arc<AtomicBool>) -> Result<()> {
+    /// Read IQ blocks until `stop` is set or the receiver hangs up. Tuner frequencies
+    /// sent on `retune` are applied between blocks.
+    pub fn stream(
+        mut self,
+        tx: SyncSender<Block>,
+        stop: Arc<AtomicBool>,
+        retune: Option<Receiver<u32>>,
+    ) -> Result<()> {
+        let mut center_hz = unsafe { rtlsdr_get_center_freq(self.dev) };
         check(unsafe { rtlsdr_reset_buffer(self.dev) }, "reset_buffer")?;
         while !stop.load(Ordering::Relaxed) {
-            let mut buf = vec![0u8; READ_LEN];
-            let mut n: c_int = 0;
-            let ret = unsafe {
-                rtlsdr_read_sync(self.dev, buf.as_mut_ptr().cast(), READ_LEN as c_int, &mut n)
-            };
-            check(ret, "read_sync")?;
-            buf.truncate(n.max(0) as usize);
-            if tx.send(buf).is_err() {
+            if let Some(hz) = retune.as_ref().and_then(|r| r.try_iter().last()) {
+                center_hz = self.set_center_freq(hz)?;
+                check(unsafe { rtlsdr_reset_buffer(self.dev) }, "reset_buffer")?;
+                // Discard one block while the PLL settles.
+                self.read()?;
+            }
+            let data = self.read()?;
+            if tx.send(Block { center_hz, data }).is_err() {
                 break;
             }
         }
         self.close();
         Ok(())
+    }
+
+    fn read(&mut self) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; READ_LEN];
+        let mut n: c_int = 0;
+        let ret =
+            unsafe { rtlsdr_read_sync(self.dev, buf.as_mut_ptr().cast(), READ_LEN as c_int, &mut n) };
+        check(ret, "read_sync")?;
+        buf.truncate(n.max(0) as usize);
+        Ok(buf)
     }
 
     fn close(&mut self) {

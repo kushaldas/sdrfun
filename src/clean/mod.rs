@@ -1,5 +1,5 @@
 //! Voice cleanup chain shared by `listen` and `clean`:
-//! band-pass → denoiser (dry/wet mix) → speech AGC + limiter, at 48 kHz in 10 ms frames.
+//! band-pass → denoiser (dry/wet mix) → presence boost → speech AGC + limiter, at 48 kHz in 10 ms frames.
 
 mod agc;
 mod flux;
@@ -49,6 +49,13 @@ pub struct CleanConfig {
     /// Low-pass corner in Hz (0 disables)
     #[arg(long, default_value_t = 3400.0)]
     pub lowpass: f32,
+    /// Treble ("presence") boost after denoising, dB; restores consonants that
+    /// denoising and weak signals lose (0 disables)
+    #[arg(long, default_value_t = 14.0, allow_negative_numbers = true)]
+    pub presence_db: f32,
+    /// Corner frequency of the presence boost, Hz
+    #[arg(long, default_value_t = 1500.0)]
+    pub presence_hz: f32,
     /// Noise suppression algorithm
     #[arg(long, value_enum, default_value_t = DenoiserKind::Rnnoise)]
     pub denoiser: DenoiserKind,
@@ -98,6 +105,7 @@ pub struct CleanChain {
     flux: flux::SpectralFlux,
     mix: f32,
     dry_delay: VecDeque<f32>,
+    presence: Option<Cascade>,
     agc: Option<agc::Agc>,
     pending: Vec<f32>,
     keep_trace: bool,
@@ -120,6 +128,8 @@ impl CleanChain {
             denoiser,
             mix: cfg.denoise_mix.clamp(0.0, 1.0),
             dry_delay,
+            presence: (cfg.presence_db != 0.0)
+                .then(|| Cascade::presence(SAMPLE_RATE as f32, cfg.presence_hz, cfg.presence_db)),
             agc: (!cfg.no_agc).then(|| agc::Agc::new(cfg.agc_target, cfg.agc_max_gain)),
             pending: Vec::with_capacity(FRAME),
             keep_trace: false,
@@ -162,8 +172,8 @@ impl CleanChain {
         self.bandpass.process_in_place(frame);
         let flux = self.flux.process(frame);
 
-        let mut probe = self.side_vad.is_some().then(|| *frame);
-        let dry = (self.mix < 1.0).then(|| *frame);
+        let mut probe = self.side_vad.is_some().then_some(*frame);
+        let dry = (self.mix < 1.0).then_some(*frame);
         let mut vad = self.denoiser.process_frame(frame);
         if let (Some(side), Some(probe)) = (&mut self.side_vad, &mut probe) {
             vad = side.process_frame(probe);
@@ -182,6 +192,9 @@ impl CleanChain {
             }
         }
 
+        if let Some(presence) = &mut self.presence {
+            presence.process_in_place(frame);
+        }
         if let Some(agc) = &mut self.agc {
             agc.process_frame(frame);
         }
