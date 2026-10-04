@@ -17,6 +17,7 @@ use crate::clean::{CleanChain, CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{Gate, GateConfig, GateEvent, Transmission, Verdict};
 use crate::recorder::{StreamWriter, TransmissionLog, recording_path};
 use crate::sdr::{Block, Device, Gain};
+use crate::serve::Streamer;
 
 /// Frames between status-line refreshes (0.5 s).
 const STATUS_FRAMES: usize = 50;
@@ -69,6 +70,10 @@ pub struct ListenArgs {
     /// Playback volume multiplier
     #[arg(long, default_value_t = 1.0)]
     pub volume: f32,
+    /// Serve a web player (live cleaned audio + status) on this address; `--serve`
+    /// alone listens on all interfaces, port 8010
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "0.0.0.0:8010")]
+    pub serve: Option<String>,
     #[command(flatten)]
     pub gate: GateConfig,
     #[command(flatten)]
@@ -117,6 +122,15 @@ pub fn run(args: ListenArgs) -> Result<()> {
         }
     };
 
+    let mut web = match &args.serve {
+        Some(addr) => {
+            let (streamer, url) = Streamer::start(addr)?;
+            eprintln!("web player on {url}");
+            Some(streamer)
+        }
+        None => None,
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -162,14 +176,27 @@ pub fn run(args: ListenArgs) -> Result<()> {
                     if let Some(s) = &mut speaker {
                         s.play(&so_far);
                     }
+                    if let Some(w) = &mut web {
+                        w.event(serde_json::json!({"type": "open"}));
+                        w.audio(&so_far);
+                    }
                     status.force = true;
                 }
                 Some(GateEvent::Closed(tx)) => {
-                    session.finish(args.freq, start, tx)?;
+                    let event = tx_event(start, &tx);
+                    let (_, file) = session.finish(args.freq, start, tx)?;
+                    if let Some(w) = &mut web {
+                        w.flush();
+                        w.transmission(event, file.as_deref());
+                    }
+                    status.force = true;
                 }
                 None if p.gate_open => {
                     if let Some(s) = &mut speaker {
                         s.play(&p.clean);
+                    }
+                    if let Some(w) = &mut web {
+                        w.audio(&p.clean);
                     }
                 }
                 None => {}
@@ -179,6 +206,18 @@ pub fn run(args: ListenArgs) -> Result<()> {
             if status.frames >= STATUS_FRAMES || status.force {
                 let adc = receiver.take_adc_stats();
                 status.print(&receiver.gate, &session, adc);
+                if let Some(w) = &web {
+                    w.event(serde_json::json!({
+                        "type": "status",
+                        "freq_mhz": args.freq,
+                        "mode": format!("{:?}", args.mode).to_uppercase(),
+                        "channel_db": status.mean_db(),
+                        "floor_db": receiver.gate.floor_db(),
+                        "open": receiver.gate.is_open(),
+                        "saved": session.kept,
+                        "dropped": session.dropped,
+                    }));
+                }
                 status = Status::default();
             }
             total_frames += 1;
@@ -196,7 +235,11 @@ pub fn run(args: ListenArgs) -> Result<()> {
         .join()
         .map_err(|_| anyhow!("SDR reader thread panicked"))??;
     if let Some(tx) = receiver.gate.flush() {
-        session.finish(args.freq, start, tx)?;
+        let event = tx_event(start, &tx);
+        let (_, file) = session.finish(args.freq, start, tx)?;
+        if let Some(w) = &web {
+            w.transmission(event, file.as_deref());
+        }
     }
     eprintln!("\r\x1b[Kdone: {} transmission(s) saved, {} dropped", session.kept, session.dropped);
     if let Some((clean_out, raw_out)) = continuous {
@@ -313,8 +356,14 @@ impl Session {
     }
 
     /// Save (or drop) a finished transmission on `freq_mhz` and log it. `start` is when
-    /// the receiver that produced it saw its first frame.
-    pub fn finish(&mut self, freq_mhz: f64, start: DateTime<Utc>, tx: Transmission) -> Result<Verdict> {
+    /// the receiver that produced it saw its first frame. Returns the verdict and,
+    /// if it was kept, the saved file.
+    pub fn finish(
+        &mut self,
+        freq_mhz: f64,
+        start: DateTime<Utc>,
+        tx: Transmission,
+    ) -> Result<(Verdict, Option<PathBuf>)> {
         let started = start + TimeDelta::milliseconds((tx.start_frame * 10) as i64);
         let seconds = tx.seconds();
         let snr = tx.peak_db - tx.floor_db;
@@ -350,7 +399,7 @@ impl Session {
             tx.voiced_ratio * 100.0,
             tx.spectral_change,
         );
-        Ok(tx.verdict)
+        Ok((tx.verdict, file))
     }
 }
 
@@ -361,14 +410,32 @@ struct Status {
     force: bool,
 }
 
+/// JSON summary of a finished transmission for the web player.
+fn tx_event(start: DateTime<Utc>, tx: &Transmission) -> serde_json::Value {
+    let started = start + TimeDelta::milliseconds((tx.start_frame * 10) as i64);
+    let snr = tx.peak_db - tx.floor_db;
+    serde_json::json!({
+        "type": "tx",
+        "start": started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "seconds": tx.seconds(),
+        "snr_db": snr.is_finite().then_some(snr),
+        "voiced": tx.voiced_ratio,
+        "verdict": tx.verdict.as_str(),
+    })
+}
+
 impl Status {
+    fn mean_db(&self) -> f32 {
+        self.power_sum / self.frames.max(1) as f32
+    }
+
     fn add(&mut self, power_db: f32) {
         self.frames += 1;
         self.power_sum += power_db;
     }
 
     fn print(&self, gate: &Gate, session: &Session, (adc_db, clip): (f32, f32)) {
-        let mean = self.power_sum / self.frames.max(1) as f32;
+        let mean = self.mean_db();
         let floor = gate.floor_db().unwrap_or(f32::NAN);
         let state = match gate.open_seconds() {
             Some(s) => format!("\x1b[1;31m● REC {s:5.1} s\x1b[0m"),

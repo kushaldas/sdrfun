@@ -7,6 +7,7 @@ mod listen;
 mod recorder;
 mod scan;
 mod sdr;
+mod serve;
 #[cfg(test)]
 mod testsig;
 mod wavio;

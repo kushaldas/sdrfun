@@ -305,7 +305,7 @@ fn record(
     if snr.is_finite() {
         t.stats.best_snr = Some(t.stats.best_snr.map_or(snr, |b| b.max(snr)));
     }
-    if session.finish(t.mhz, start, tx)? == Verdict::Kept {
+    if session.finish(t.mhz, start, tx)?.0 == Verdict::Kept {
         t.stats.kept += 1;
         t.stats.voice_s += seconds;
     }

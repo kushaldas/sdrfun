@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0d1117">
+<title>sdrfun</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --dim: #8b949e;
+    --accent: #3fb950; --rx: #f85149; --warn: #d29922;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  }
+  main { max-width: 520px; margin: 0 auto; display: grid; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .freq { font: 600 2.4rem/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: -0.02em; }
+  .unit { color: var(--dim); font-size: 1rem; margin-left: 4px; }
+  .mode { color: var(--dim); font-size: 0.9rem; text-transform: uppercase; }
+  .state { display: inline-flex; align-items: center; gap: 8px; margin-top: 12px; font-weight: 600; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+  .state.rx .dot { background: var(--rx); box-shadow: 0 0 10px var(--rx); }
+  .state.rx { color: var(--rx); }
+  .state.off .dot { background: var(--warn); }
+  .meter { margin-top: 12px; height: 8px; background: #0b0f14; border-radius: 4px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+  .levels { display: flex; justify-content: space-between; color: var(--dim); font-size: 0.8rem; margin-top: 6px;
+            font-variant-numeric: tabular-nums; }
+  button {
+    width: 100%; padding: 18px; font-size: 1.2rem; font-weight: 600; border: 0; border-radius: 12px;
+    background: var(--accent); color: #04130a; -webkit-tap-highlight-color: transparent;
+  }
+  button.stop { background: #21262d; color: var(--text); border: 1px solid var(--line); }
+  label { display: flex; align-items: center; gap: 12px; color: var(--dim); font-size: 0.9rem; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  h2 { font-size: 0.85rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 8px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: grid; grid-template-columns: 5em 3.5em 1fr auto 2.6em; gap: 8px; padding: 6px 0;
+       align-items: center; border-top: 1px solid var(--line); font-size: 0.9rem;
+       font-variant-numeric: tabular-nums; }
+  li.playing { color: var(--accent); }
+  .replay { width: 2.6em; height: 2.2em; padding: 0; font-size: 0.95rem; border-radius: 8px;
+            background: #21262d; color: var(--text); border: 1px solid var(--line); }
+  li.playing .replay { background: var(--accent); color: #04130a; border-color: var(--accent); }
+  li:first-child { border-top: 0; }
+  .kept { color: var(--accent); }
+  .dropped { color: var(--dim); }
+  .empty { color: var(--dim); font-size: 0.9rem; }
+  .note { color: var(--dim); font-size: 0.8rem; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <section class="card">
+    <div class="head">
+      <div><span class="freq" id="freq">---.---</span><span class="unit">MHz</span></div>
+      <span class="mode" id="mode"></span>
+    </div>
+    <div class="state off" id="state"><span class="dot"></span><span id="stateText">not connected</span></div>
+    <div class="meter"><div id="meter"></div></div>
+    <div class="levels"><span id="channel">channel —</span><span id="floor">floor —</span><span id="counts"></span></div>
+    <div class="levels"><span id="audioInfo">live audio: press Play</span></div>
+  </section>
+
+  <button id="play">Play</button>
+  <label>Volume <input id="volume" type="range" min="0" max="3" step="0.05" value="1"></label>
+
+  <section class="card">
+    <h2>Transmissions this run</h2>
+    <ul id="log"><li class="empty">none yet</li></ul>
+  </section>
+
+  <p class="note">Live audio plays only while someone is transmitting. Tap ▶ to replay a saved one.
+    Keep this page open; the screen is kept awake while playing.</p>
+  <audio id="player" preload="none"></audio>
+</main>
+
+<script>
+const RATE = 24000;          // must match STREAM_RATE in serve.rs
+const LEAD = 0.25;           // seconds of buffering when audio (re)starts
+const $ = (id) => document.getElementById(id);
+let ctx = null, gain = null, ws = null, next = 0, playing = false, wakeLock = null;
+let receivedS = 0;
+
+// iOS mutes Web Audio with the silent switch unless the page also plays an HTML
+// media element (navigator.audioSession, the proper fix, needs https). A looping
+// silent clip, started from the Play tap, keeps the page in "playback" mode.
+const keepAlive = new Audio(silentWavUrl(0.5));
+keepAlive.loop = true;
+keepAlive.setAttribute('playsinline', '');
+
+function silentWavUrl(seconds) {
+  const rate = 8000, n = Math.round(rate * seconds), buf = new ArrayBuffer(44 + 2 * n), v = new DataView(buf);
+  const text = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  text(0, 'RIFF'); v.setUint32(4, 36 + 2 * n, true); text(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, 2 * rate, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); text(36, 'data'); v.setUint32(40, 2 * n, true);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+function showAudio() {
+  const state = ctx ? ctx.state : 'off';
+  $('audioInfo').textContent = playing
+    ? `live audio: ${state} · ${receivedS.toFixed(1)} s received`
+    : 'live audio: press Play';
+}
+
+function setState(cls, text) {
+  $('state').className = 'state ' + cls;
+  $('stateText').textContent = text;
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(proto + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    setState('', 'idle');
+    // The server replays this run's transmissions on every connect.
+    $('log').innerHTML = '<li class="empty">none yet</li>';
+  };
+  ws.onmessage = (e) => (typeof e.data === 'string' ? onEvent(JSON.parse(e.data)) : onAudio(e.data));
+  ws.onclose = () => {
+    setState('off', 'reconnecting…');
+    setTimeout(connect, 2000);
+  };
+}
+
+function onAudio(buf) {
+  if (!ctx || !playing) return;
+  // iOS may suspend or interrupt the context (calls, other apps); try to get it back.
+  if (ctx.state !== 'running') ctx.resume().catch(() => {});
+  const pcm = new Int16Array(buf);
+  receivedS += pcm.length / RATE;
+  const ab = ctx.createBuffer(1, pcm.length, RATE);
+  const ch = ab.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const src = ctx.createBufferSource();
+  src.buffer = ab;
+  src.connect(gain);
+  const now = ctx.currentTime;
+  if (next < now + 0.02) next = now + LEAD;   // after a gap, rebuild a small buffer
+  src.start(next);
+  next += ab.duration;
+  showAudio();
+}
+
+function onEvent(ev) {
+  if (ev.type === 'status') {
+    $('freq').textContent = ev.freq_mhz.toFixed(3);
+    $('mode').textContent = ev.mode;
+    $('channel').textContent = 'channel ' + ev.channel_db.toFixed(1) + ' dB';
+    $('floor').textContent = ev.floor_db == null ? 'floor —' : 'floor ' + ev.floor_db.toFixed(1) + ' dB';
+    $('counts').textContent = ev.saved + ' saved · ' + ev.dropped + ' dropped';
+    const above = ev.floor_db == null ? 0 : ev.channel_db - ev.floor_db;
+    $('meter').style.width = Math.max(0, Math.min(100, above * 3.3)) + '%';
+    setState(ev.open ? 'rx' : '', ev.open ? 'receiving' : 'idle');
+  } else if (ev.type === 'open') {
+    setState('rx', 'receiving');
+  } else if (ev.type === 'tx') {
+    const log = $('log');
+    if (log.querySelector('.empty')) log.innerHTML = '';
+    const li = document.createElement('li');
+    const kept = ev.verdict === 'kept';
+    const time = new Date(ev.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    li.innerHTML = `<span>${time}</span><span>${ev.seconds.toFixed(1)} s</span>` +
+      `<span>${ev.snr_db == null ? '' : ev.snr_db.toFixed(0) + ' dB'}</span>` +
+      `<span class="${kept ? 'kept' : 'dropped'}">${kept ? 'voice' : ev.verdict.replace('_', ' ')}</span>` +
+      (ev.url ? `<button class="replay" aria-label="Play recording">▶</button>` : '<span></span>');
+    if (ev.url) li.querySelector('.replay').addEventListener('click', () => replay(li, ev.url));
+    log.prepend(li);
+    while (log.children.length > 500) log.lastChild.remove();
+  }
+}
+
+// One shared player for saved recordings.
+const player = $('player');
+let replaying = null;
+
+function markReplay(li) {
+  if (replaying) {
+    replaying.classList.remove('playing');
+    replaying.querySelector('.replay').textContent = '▶';
+  }
+  replaying = li;
+  if (li) {
+    li.classList.add('playing');
+    li.querySelector('.replay').textContent = '❚❚';
+  }
+}
+
+function replay(li, url) {
+  if (replaying === li) {          // tap again to stop
+    player.pause();
+    markReplay(null);
+    return;
+  }
+  if (navigator.audioSession) navigator.audioSession.type = 'playback';
+  player.src = url;
+  player.volume = Math.min(1, Number($('volume').value));
+  player.play().then(() => markReplay(li)).catch(() => markReplay(null));
+}
+player.addEventListener('ended', () => markReplay(null));
+// iOS plays one media element at a time: bring the keep-alive back after a replay.
+player.addEventListener('pause', () => { if (playing) keepAlive.play().catch(() => {}); });
+
+async function start() {
+  // Must happen synchronously inside the tap, before any await.
+  keepAlive.play().catch(() => {});
+  if (!ctx) {
+    // Play through the media channel so the iOS silent switch does not mute it.
+    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    gain = ctx.createGain();
+    gain.gain.value = Number($('volume').value);
+    gain.connect(ctx.destination);
+    ctx.onstatechange = showAudio;
+  }
+  const resumed = ctx.resume();
+  playing = true;
+  next = 0;
+  receivedS = 0;
+  showAudio();
+  await resumed.catch(() => {});
+  showAudio();
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
+  $('play').textContent = 'Stop';
+  $('play').className = 'stop';
+}
+
+async function stop() {
+  playing = false;
+  keepAlive.pause();
+  if (ctx) await ctx.suspend();
+  showAudio();
+  try { await wakeLock?.release(); } catch (_) {}
+  wakeLock = null;
+  $('play').textContent = 'Play';
+  $('play').className = '';
+}
+
+connect();
+$('play').addEventListener('click', () => (playing ? stop() : start()));
+$('volume').addEventListener('input', (e) => { if (gain) gain.gain.value = Number(e.target.value); });
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && playing) {
+    if (ctx) await ctx.resume();
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
+  }
+});
+</script>
+</body>
+</html>
