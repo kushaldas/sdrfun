@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::Args;
 
-use crate::channel::Channel;
+use crate::channel::{Channel, Mode};
 use crate::clean::{CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{GateConfig, GateEvent, Verdict};
 use crate::listen::{Receiver, Session};
@@ -65,9 +65,12 @@ pub struct ScanArgs {
     /// IQ sample rate, a multiple of 48000
     #[arg(long, default_value_t = 2_400_000)]
     pub sample_rate: u32,
-    /// Channel filter width, Hz
-    #[arg(long, default_value_t = 10_000.0)]
-    pub bandwidth: f32,
+    /// Demodulation: am (airband) or fm (amateur, PMR)
+    #[arg(long, value_enum, default_value_t = Mode::Am)]
+    pub mode: Mode,
+    /// Channel filter width, Hz [default: 10000 for AM, 12500 for FM]
+    #[arg(long)]
+    pub bandwidth: Option<f32>,
     /// Directory for recordings
     #[arg(long, default_value = "recordings")]
     pub out_dir: PathBuf,
@@ -136,19 +139,43 @@ fn plan_groups(mhz: &[f64], sample_rate: u32) -> Vec<Group> {
         }
     }
     for g in &mut groups {
-        let lo = mhz[g.members[0]] * 1e6;
-        let hi = mhz[*g.members.last().unwrap()] * 1e6;
-        let mut center = (lo + hi) / 2.0;
-        if g.members.iter().any(|&i| (mhz[i] * 1e6 - center).abs() < DC_GUARD_HZ) {
-            center += 2.0 * DC_GUARD_HZ;
-        }
-        g.center_hz = center.round() as u32;
+        let hz: Vec<f64> = g.members.iter().map(|&i| mhz[i] * 1e6).collect();
+        g.center_hz = place_center(&hz, sample_rate).round() as u32;
     }
     groups
 }
 
+/// Tuner centre for a group: the position nearest the midpoint that keeps every channel
+/// `DC_GUARD_HZ` from the DC spike, or, when channels are too dense for that, the one
+/// that keeps the nearest channel farthest away (e.g. halfway between two channels).
+fn place_center(hz: &[f64], sample_rate: u32) -> f64 {
+    let (lo, hi) = (hz[0], hz[hz.len() - 1]);
+    let mid = (lo + hi) / 2.0;
+    // Channels must stay inside the captured band with room for their filter.
+    let reach = sample_rate as f64 * 0.45;
+    let slack = (reach - (hi - lo) / 2.0).max(0.0);
+    let clearance = |c: f64| hz.iter().map(|f| (f - c).abs()).fold(f64::MAX, f64::min);
+
+    let step = 250.0;
+    let steps = (slack / step) as i64;
+    // Search outwards from the midpoint: 0, +1, -1, +2, -2, ...
+    let candidates = (0..=2 * steps).map(|k| mid + step * if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) } as f64);
+    let mut best = (mid, clearance(mid));
+    for c in candidates {
+        let d = clearance(c);
+        if d >= DC_GUARD_HZ {
+            return c;
+        }
+        if d > best.1 + 1.0 {
+            best = (c, d);
+        }
+    }
+    best.0
+}
+
 pub fn run(args: ScanArgs) -> Result<()> {
     let mut targets = parse_targets(&args.freqs)?;
+    let bandwidth = args.bandwidth.unwrap_or(args.mode.default_bandwidth());
     let groups = plan_groups(&targets.iter().map(|t| t.mhz).collect::<Vec<_>>(), args.sample_rate);
 
     let mut dev = Device::open(args.device)?;
@@ -158,12 +185,13 @@ pub fn run(args: ScanArgs) -> Result<()> {
     dev.set_center_freq(groups[0].center_hz)?;
 
     eprintln!(
-        "scanning {} frequencies in {} group(s), {:.0} s each (gain {}, bandwidth {:.1} kHz)",
+        "scanning {} frequencies in {} group(s), {:.0} s each ({:?}, gain {}, bandwidth {:.1} kHz)",
         targets.len(),
         groups.len(),
         args.dwell,
+        args.mode,
         gain.map_or("auto".into(), |g| format!("{g:.1} dB")),
-        args.bandwidth / 1e3,
+        bandwidth / 1e3,
     );
     for (n, g) in groups.iter().enumerate() {
         let list: Vec<String> = g.members.iter().map(|&i| format!("{:.3}", targets[i].mhz)).collect();
@@ -200,7 +228,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
                 .iter()
                 .map(|&i| {
                     let offset = targets[i].mhz * 1e6 - tuned as f64;
-                    Ok(Receiver::new(Channel::new(rate, offset, args.bandwidth)?, &args.clean, args.gate.clone()))
+                    Ok(Receiver::new(Channel::new(rate, offset, bandwidth, args.mode)?, &args.clean, args.gate.clone()))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -322,6 +350,33 @@ mod tests {
                 assert!(off <= 2_400_000.0 * 0.4, "{} near the band edge", mhz[i]);
             }
         }
+    }
+
+    /// Tuner centre and distance of the nearest channel from it, for a 12.5 kHz grid.
+    fn grid_placement(count: usize) -> (f64, f64, Vec<f64>) {
+        let mhz: Vec<f64> = (0..count).map(|k| 145.000 + 0.0125 * k as f64).collect();
+        let groups = plan_groups(&mhz, 2_400_000);
+        assert_eq!(groups.len(), 1);
+        let c = groups[0].center_hz as f64;
+        let nearest = mhz.iter().map(|m| (m * 1e6 - c).abs()).fold(f64::MAX, f64::min);
+        for m in &mhz {
+            assert!((m * 1e6 - c).abs() < 2_400_000.0 * 0.45, "{m} outside the captured band");
+        }
+        (c, nearest, mhz)
+    }
+
+    #[test]
+    fn dense_grid_moves_dc_clear_of_all_channels_when_there_is_room() {
+        // 32 channels span 387.5 kHz: there is room to put DC beside the grid.
+        let (_, nearest, _) = grid_placement(32);
+        assert!(nearest >= DC_GUARD_HZ, "nearest channel {nearest} Hz from DC");
+    }
+
+    #[test]
+    fn full_width_dense_grid_puts_dc_between_two_channels() {
+        // 145 channels span the full 1.8 MHz: no clear spot, so split a channel gap.
+        let (_, nearest, _) = grid_placement(145);
+        assert!((nearest - 6250.0).abs() < 300.0, "nearest channel {nearest} Hz from DC");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use clap::Args;
 
 use crate::audio_out::AudioOut;
-use crate::channel::{Channel, Frame};
+use crate::channel::{Channel, Frame, Mode};
 use crate::clean::{CleanChain, CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{Gate, GateConfig, GateEvent, Transmission, Verdict};
 use crate::recorder::{StreamWriter, TransmissionLog, recording_path};
@@ -42,9 +42,12 @@ pub struct ListenArgs {
     /// Tune this far above the target, kHz, to keep the DC spike out of the channel
     #[arg(long, default_value_t = 250.0, allow_negative_numbers = true)]
     pub offset_khz: f64,
-    /// Channel filter width, Hz
-    #[arg(long, default_value_t = 10_000.0)]
-    pub bandwidth: f32,
+    /// Demodulation: am (airband) or fm (amateur, PMR)
+    #[arg(long, value_enum, default_value_t = Mode::Am)]
+    pub mode: Mode,
+    /// Channel filter width, Hz [default: 10000 for AM, 12500 for FM]
+    #[arg(long)]
+    pub bandwidth: Option<f32>,
     /// Stop after this many seconds (0 = run until Ctrl-C)
     #[arg(long, default_value_t = 0.0)]
     pub duration: f64,
@@ -81,19 +84,21 @@ pub fn run(args: ListenArgs) -> Result<()> {
     dev.set_ppm(args.ppm)?;
     let gain = dev.set_gain(args.gain)?;
     let center = dev.set_center_freq(wanted_center)?;
+    let bandwidth = args.bandwidth.unwrap_or(args.mode.default_bandwidth());
     let mut receiver = Receiver::new(
-        Channel::new(rate, target_hz - center as f64, args.bandwidth)?,
+        Channel::new(rate, target_hz - center as f64, bandwidth, args.mode)?,
         &args.clean,
         args.gate.clone(),
     );
 
     eprintln!(
-        "listening on {:.3} MHz AM (tuner {:.3} MHz, {:.2} MS/s, gain {}, bandwidth {:.1} kHz, denoiser {:?})",
+        "listening on {:.3} MHz {:?} (tuner {:.3} MHz, {:.2} MS/s, gain {}, bandwidth {:.1} kHz, denoiser {:?})",
         args.freq,
+        args.mode,
         center as f64 / 1e6,
         rate as f64 / 1e6,
         gain.map_or("auto".into(), |g| format!("{g:.1} dB")),
-        args.bandwidth / 1e3,
+        bandwidth / 1e3,
         args.clean.denoiser,
     );
 
@@ -440,7 +445,7 @@ mod tests {
     /// Run IQ through a default receiver; return the closed transmissions.
     fn receive(fs: u32, offset: f64, iq: &[u8]) -> Vec<Transmission> {
         let args = Wrapper::parse_from(["x"]);
-        let channel = Channel::new(fs, offset, 10_000.0).unwrap();
+        let channel = Channel::new(fs, offset, 10_000.0, Mode::Am).unwrap();
         let mut rx = Receiver::new(channel, &args.clean, args.gate);
         let mut closed = Vec::new();
         for block in iq.chunks(2 * 12_000) {
