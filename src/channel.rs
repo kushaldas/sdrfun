@@ -1,5 +1,5 @@
-//! One AM channel: IQ → frequency shift → decimate to 48 kHz → channel filter →
-//! power and carrier measurement + envelope demodulation, emitted as 10 ms frames.
+//! One channel: IQ → frequency shift → decimate to 48 kHz → channel filter →
+//! power and carrier measurement + AM or FM demodulation, emitted as 10 ms frames.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -13,6 +13,56 @@ use crate::dsp::fir::{Decimator, lowpass};
 /// Time constant of the carrier-level tracker used to normalise AM depth.
 const CARRIER_TAU_S: f32 = 0.05;
 const CHANNEL_TAPS: usize = 129;
+/// Narrowband FM: peak deviation that maps to ±0.5 audio (like 100 % AM).
+const FM_DEVIATION_HZ: f32 = 2500.0;
+/// NBFM de-emphasis corner (6 dB/octave above it), normalised to unity at 1 kHz.
+const FM_DEEMPHASIS_HZ: f32 = 300.0;
+
+/// Demodulation: AM for airband, narrowband FM for amateur/PMR voice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mode {
+    Am,
+    Fm,
+}
+
+impl Mode {
+    /// Channel filter width used when `--bandwidth` is not given.
+    pub fn default_bandwidth(self) -> f32 {
+        match self {
+            Mode::Am => 10_000.0,
+            Mode::Fm => 12_500.0,
+        }
+    }
+}
+
+/// Phase-difference FM discriminator with de-emphasis.
+struct FmDemod {
+    prev: Complex32,
+    scale: f32,
+    deemph: f32,
+    alpha: f32,
+    norm: f32,
+}
+
+impl FmDemod {
+    fn new() -> Self {
+        let fs = SAMPLE_RATE as f32;
+        Self {
+            prev: Complex32::new(1.0, 0.0),
+            scale: 0.5 * fs / (2.0 * std::f32::consts::PI * FM_DEVIATION_HZ),
+            deemph: 0.0,
+            alpha: 1.0 - (-2.0 * std::f32::consts::PI * FM_DEEMPHASIS_HZ / fs).exp(),
+            norm: (1.0 + (1000.0 / FM_DEEMPHASIS_HZ).powi(2)).sqrt(),
+        }
+    }
+
+    fn sample(&mut self, z: Complex32) -> f32 {
+        let phase_step = (z * self.prev.conj()).arg();
+        self.prev = z;
+        self.deemph += (phase_step * self.scale - self.deemph) * self.alpha;
+        self.deemph * self.norm
+    }
+}
 
 pub struct Frame {
     /// Demodulated audio, 48 kHz, roughly ±0.5 at 100 % modulation.
@@ -89,11 +139,12 @@ pub struct Channel {
     iq: Vec<Complex32>,
     power_sum: f32,
     detector: CarrierDetector,
+    fm: Option<FmDemod>,
 }
 
 impl Channel {
     /// `offset_hz` is the target frequency relative to the tuner centre.
-    pub fn new(sample_rate: u32, offset_hz: f64, bandwidth_hz: f32) -> Result<Self> {
+    pub fn new(sample_rate: u32, offset_hz: f64, bandwidth_hz: f32, mode: Mode) -> Result<Self> {
         if !sample_rate.is_multiple_of(SAMPLE_RATE) {
             bail!("sample rate {sample_rate} must be a multiple of {SAMPLE_RATE}");
         }
@@ -136,6 +187,7 @@ impl Channel {
             iq: Vec::with_capacity(FRAME),
             power_sum: 0.0,
             detector: CarrierDetector::new(bandwidth_hz),
+            fm: (mode == Mode::Fm).then(FmDemod::new),
         })
     }
 
@@ -162,12 +214,18 @@ impl Channel {
 
         for &z in b.iter() {
             let power = z.norm_sqr();
-            let env = power.sqrt();
-            if self.carrier == 0.0 {
-                self.carrier = env;
-            }
-            self.carrier += (env - self.carrier) * self.carrier_alpha;
-            self.audio.push(0.5 * (env / self.carrier.max(1e-9) - 1.0));
+            let sample = match &mut self.fm {
+                Some(fm) => fm.sample(z),
+                None => {
+                    let env = power.sqrt();
+                    if self.carrier == 0.0 {
+                        self.carrier = env;
+                    }
+                    self.carrier += (env - self.carrier) * self.carrier_alpha;
+                    0.5 * (env / self.carrier.max(1e-9) - 1.0)
+                }
+            };
+            self.audio.push(sample);
             self.iq.push(z);
             self.power_sum += power;
             if self.audio.len() == FRAME {
@@ -227,7 +285,7 @@ mod tests {
     #[test]
     fn demodulates_offset_am_tone() {
         let fs = 2_400_000;
-        let mut ch = Channel::new(fs, 250_000.0, 10_000.0).unwrap();
+        let mut ch = Channel::new(fs, 250_000.0, 10_000.0, Mode::Am).unwrap();
         let mut frames = Vec::new();
         for block in am_iq(fs, 250_000.0, 0.8, 0.3, 0.5).chunks(262_144) {
             ch.process_u8(block, &mut frames);
@@ -260,23 +318,48 @@ mod tests {
     #[test]
     fn carrier_prominence_separates_noise_and_carrier() {
         let fs = 2_400_000;
-        let mut ch = Channel::new(fs, 250_000.0, 10_000.0).unwrap();
+        let mut ch = Channel::new(fs, 250_000.0, 10_000.0, Mode::Am).unwrap();
         let mut frames = Vec::new();
         ch.process_u8(&noise_iq(0.5, fs), &mut frames);
         let noise: Vec<f32> = frames[5..].iter().map(|f| f.carrier_db).collect();
         let worst = noise.iter().copied().fold(f32::MIN, f32::max);
         assert!(worst < 4.0, "noise prominence up to {worst} dB");
 
-        let mut ch = Channel::new(fs, 250_000.0, 10_000.0).unwrap();
+        let mut ch = Channel::new(fs, 250_000.0, 10_000.0, Mode::Am).unwrap();
         let mut frames = Vec::new();
         ch.process_u8(&am_iq(fs, 250_000.0, 0.8, 0.3, 0.3), &mut frames);
         assert!(frames[10].carrier_db > 20.0, "carrier prominence {}", frames[10].carrier_db);
     }
 
     #[test]
+    fn demodulates_offset_fm_tone() {
+        let fs = 2_400_000;
+        let mut ch = Channel::new(fs, 250_000.0, 12_500.0, Mode::Fm).unwrap();
+        // 1 kHz tone at full (2.5 kHz) deviation.
+        let n = fs as usize / 2;
+        let mut phase = 0.0f64;
+        let mut iq = Vec::with_capacity(2 * n);
+        for i in 0..n {
+            let t = i as f64 / fs as f64;
+            let inst = 250_000.0 + 2500.0 * (2.0 * std::f64::consts::PI * 1000.0 * t).sin();
+            phase += 2.0 * std::f64::consts::PI * inst / fs as f64;
+            for v in [0.3 * phase.cos(), 0.3 * phase.sin()] {
+                iq.push((127.4 + v * 128.0).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        let mut frames = Vec::new();
+        ch.process_u8(&iq, &mut frames);
+        let audio: Vec<f32> = frames[10..].iter().flat_map(|f| f.audio).collect();
+        let rms = (audio.iter().map(|x| x * x).sum::<f32>() / audio.len() as f32).sqrt();
+        // ±0.5 at full deviation, de-emphasis unity at 1 kHz → RMS ≈ 0.354.
+        assert!((rms - 0.354).abs() < 0.03, "rms {rms}");
+        assert!(frames[20].carrier_db > 6.0, "FM carrier prominence {}", frames[20].carrier_db);
+    }
+
+    #[test]
     fn rejects_signal_outside_channel() {
         let fs = 2_400_000;
-        let mut ch = Channel::new(fs, 250_000.0, 10_000.0).unwrap();
+        let mut ch = Channel::new(fs, 250_000.0, 10_000.0, Mode::Am).unwrap();
         let mut frames = Vec::new();
         // Same signal 25 kHz away (one 25 kHz channel up).
         for block in am_iq(fs, 275_000.0, 0.8, 0.3, 0.3).chunks(262_144) {
