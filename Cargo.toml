@@ -19,6 +19,7 @@ hound = "3.5.1"
 nnnoiseless = "0.5.2"
 rustfft = "6.4.1"
 serde_json = "1.0.151"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [build-dependencies]
 pkg-config = "0.3.34"

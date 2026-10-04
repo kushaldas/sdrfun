@@ -65,6 +65,18 @@ pub enum Verdict {
     SteadyTone,
 }
 
+impl Verdict {
+    /// Name used in the log and the web stream.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Kept => "kept",
+            Verdict::TooShort => "too_short",
+            Verdict::NoVoice => "no_voice",
+            Verdict::SteadyTone => "steady_tone",
+        }
+    }
+}
+
 pub struct Transmission {
     /// Index of the first frame (including pre-roll) since the gate was created.
     pub start_frame: u64,

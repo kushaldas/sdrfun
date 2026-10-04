@@ -10,7 +10,7 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 
 use crate::clean::SAMPLE_RATE;
 use crate::dsp::resample::Resampler;
-use crate::gate::{Transmission, Verdict};
+use crate::gate::Transmission;
 
 pub const RECORD_RATE: u32 = 16_000;
 
@@ -108,12 +108,7 @@ impl TransmissionLog {
             "snr_db": round1(tx.peak_db - tx.floor_db),
             "voiced_ratio": round(tx.voiced_ratio, 2),
             "spectral_change": round(tx.spectral_change, 2),
-            "verdict": match tx.verdict {
-                Verdict::Kept => "kept",
-                Verdict::TooShort => "too_short",
-                Verdict::NoVoice => "no_voice",
-                Verdict::SteadyTone => "steady_tone",
-            },
+            "verdict": tx.verdict.as_str(),
             "file": file.map(|p| p.display().to_string()),
         });
         writeln!(self.file, "{entry}")?;
@@ -132,6 +127,7 @@ pub fn recording_path(out_dir: &Path, freq_mhz: f64, start: DateTime<Utc>, tag: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::Verdict;
     use chrono::TimeZone;
 
     #[test]

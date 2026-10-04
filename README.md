@@ -23,6 +23,7 @@ The udev rules from the `rtl-sdr` package give your user access to the dongle; r
 sdrfun listen                       # 120.150 MHz AM, all defaults; Ctrl-C to stop
 sdrfun listen 118.700 --save-raw    # also keep the un-cleaned audio
 sdrfun listen --no-play             # record only
+sdrfun listen --serve               # also stream to a phone: open http://<this-pc>:8010/
 sdrfun scan                         # survey Stockholm Arlanda frequencies, report which carry voice
 sdrfun scan 118.5=Tower 121.5=Guard --dwell 60 --rounds 3
 sdrfun clean in.wav --play          # run the cleanup chain on a WAV file and listen
