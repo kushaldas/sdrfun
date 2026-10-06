@@ -43,10 +43,10 @@ pub struct ListenArgs {
     /// Tune this far above the target, kHz, to keep the DC spike out of the channel
     #[arg(long, default_value_t = 250.0, allow_negative_numbers = true)]
     pub offset_khz: f64,
-    /// Demodulation: am (airband) or fm (amateur, PMR)
+    /// Demodulation: am (airband), nfm/fm (amateur, PMR), wfm (broadcast), usb, lsb or cw
     #[arg(long, value_enum, default_value_t = Mode::Am)]
     pub mode: Mode,
-    /// Channel filter width, Hz [default: 10000 for AM, 12500 for FM]
+    /// Channel filter width, Hz [default: 10000 AM, 12500 NFM, 180000 WFM, 2400 USB/LSB, 500 CW]
     #[arg(long)]
     pub bandwidth: Option<f32>,
     /// Stop after this many seconds (0 = run until Ctrl-C)

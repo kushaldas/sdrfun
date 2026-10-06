@@ -1,4 +1,6 @@
+mod adpcm;
 mod audio_out;
+mod bookmarks;
 mod channel;
 mod clean;
 mod dsp;
@@ -7,10 +9,13 @@ mod listen;
 mod recorder;
 mod scan;
 mod sdr;
+mod spectrum;
 mod serve;
+mod squelch;
 #[cfg(test)]
 mod testsig;
 mod wavio;
+mod web;
 
 use std::path::PathBuf;
 
@@ -20,7 +25,7 @@ use clap::{Parser, Subcommand};
 use clean::{CleanConfig, SAMPLE_RATE};
 
 #[derive(Parser)]
-#[command(version, about = "Listen to AM airband voice on an RTL-SDR, clean it up, play and record it")]
+#[command(version, about = "Listen to voice on an RTL-SDR: clean it up, play, record, or tune it from a phone")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -54,6 +59,8 @@ enum Command {
         #[command(flatten)]
         cfg: CleanConfig,
     },
+    /// Interactive receiver for phones: waterfall, tuning, modes and bookmarks in a web page
+    Web(web::WebArgs),
     /// List RTL-SDR devices and audio outputs
     Devices,
 }
@@ -62,6 +69,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Listen(args) => listen::run(args),
         Command::Scan(args) => scan::run(args),
+        Command::Web(args) => web::run(args),
         Command::Clean {
             input,
             output,

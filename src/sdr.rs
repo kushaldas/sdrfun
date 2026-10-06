@@ -36,10 +36,22 @@ unsafe extern "C" {
 /// Bytes per synchronous read: 128 Ki IQ pairs, ~55 ms at 2.4 MS/s.
 const READ_LEN: usize = 16 * 16384;
 
-/// A block of raw IQ, tagged with the tuner frequency it was captured at.
+/// A block of raw IQ, tagged with the tuner frequency and sample rate it was captured at.
 pub struct Block {
     pub center_hz: u32,
+    pub rate: u32,
+    /// Counts gain and sample-rate changes applied so far, so consumers can tell which
+    /// blocks were captured with new settings.
+    pub settings: u32,
     pub data: Vec<u8>,
+}
+
+/// Changes applied by `Device::stream` between blocks.
+#[derive(Clone, Copy, Debug)]
+pub enum Control {
+    Center(u32),
+    Gain(Gain),
+    Rate(u32),
 }
 
 pub struct DeviceInfo {
@@ -194,25 +206,61 @@ impl Device {
         v
     }
 
-    /// Read IQ blocks until `stop` is set or the receiver hangs up. Tuner frequencies
-    /// sent on `retune` are applied between blocks.
+    /// Read IQ blocks until `stop` is set or the receiver hangs up. Changes sent on
+    /// `control` are applied between blocks; the latest of each kind wins.
     pub fn stream(
         mut self,
         tx: SyncSender<Block>,
         stop: Arc<AtomicBool>,
-        retune: Option<Receiver<u32>>,
+        control: Option<Receiver<Control>>,
     ) -> Result<()> {
         let mut center_hz = unsafe { rtlsdr_get_center_freq(self.dev) };
+        let mut rate = unsafe { rtlsdr_get_sample_rate(self.dev) };
+        let mut settings = 0u32;
         check(unsafe { rtlsdr_reset_buffer(self.dev) }, "reset_buffer")?;
         while !stop.load(Ordering::Relaxed) {
-            if let Some(hz) = retune.as_ref().and_then(|r| r.try_iter().last()) {
-                center_hz = self.set_center_freq(hz)?;
+            let (mut want_center, mut want_gain, mut want_rate) = (None, None, None);
+            for c in control.iter().flat_map(|r| r.try_iter()) {
+                match c {
+                    Control::Center(hz) => want_center = Some(hz),
+                    Control::Gain(g) => want_gain = Some(g),
+                    Control::Rate(r) => want_rate = Some(r),
+                }
+            }
+            // A rejected change (e.g. a frequency the tuner cannot reach) keeps the old
+            // setting rather than stopping the stream; consumers see it in the blocks.
+            let mut settle = false;
+            if let Some(g) = want_gain {
+                match self.set_gain(g) {
+                    Ok(_) => {
+                        settings = settings.wrapping_add(1);
+                        settle = true;
+                    }
+                    Err(e) => eprintln!("\r\x1b[Kwarning: gain {g}: {e:#}"),
+                }
+            }
+            if settle || want_center.is_some() || want_rate.is_some() {
+                if let Some(r) = want_rate {
+                    match self.set_sample_rate(r) {
+                        Ok(r) => {
+                            rate = r;
+                            settings = settings.wrapping_add(1);
+                        }
+                        Err(e) => eprintln!("\r\x1b[Kwarning: sample rate {r}: {e:#}"),
+                    }
+                }
+                if let Some(hz) = want_center {
+                    match self.set_center_freq(hz) {
+                        Ok(hz) => center_hz = hz,
+                        Err(e) => eprintln!("\r\x1b[Kwarning: tuning to {hz} Hz: {e:#}"),
+                    }
+                }
                 check(unsafe { rtlsdr_reset_buffer(self.dev) }, "reset_buffer")?;
-                // Discard one block while the PLL settles.
+                // Discard one block while the PLL and gain settle.
                 self.read()?;
             }
             let data = self.read()?;
-            if tx.send(Block { center_hz, data }).is_err() {
+            if tx.send(Block { center_hz, rate, settings, data }).is_err() {
                 break;
             }
         }

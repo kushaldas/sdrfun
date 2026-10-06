@@ -1,7 +1,8 @@
 # sdrfun
 
-Listen to AM airband voice on an RTL-SDR (tested with the RTL-SDR Blog V4). The tool cleans up
-the audio, plays it on the speaker and saves each voice transmission as a WAV file.
+Listen to voice on an RTL-SDR (tested with the RTL-SDR Blog V4). `listen` and `scan` clean up AM
+airband or FM voice, play it on the speaker and save each voice transmission as a WAV file. `web` is
+an interactive receiver for your phone, similar to OpenWebRX but designed for a phone screen.
 
 ## Build requirements
 
@@ -24,12 +25,43 @@ sdrfun listen                       # 120.150 MHz AM, all defaults; Ctrl-C to st
 sdrfun listen 118.700 --save-raw    # also keep the un-cleaned audio
 sdrfun listen --no-play             # record only
 sdrfun listen --serve               # also stream to a phone: open http://<this-pc>:8010/
+sdrfun listen 145.5 --mode nfm      # amateur FM; also wfm, usb, lsb, cw
 sdrfun scan                         # survey Stockholm Arlanda frequencies, report which carry voice
 sdrfun scan 118.5=Tower 121.5=Guard --dwell 60 --rounds 3
 sdrfun clean in.wav --play          # run the cleanup chain on a WAV file and listen
 sdrfun devices                      # RTL-SDR devices and audio outputs
 sdrfun listen --help                # every option, with its default
 ```
+
+### Receiver on your phone
+
+```
+sdrfun web                          # 145.500 MHz NFM; open http://<this-pc>:8010/ on the phone
+sdrfun web 99.3 --mode wfm          # start on an FM broadcast station
+sdrfun web --no-play --gain auto    # sound only on the phone
+```
+
+The page shows a waterfall of the whole captured band (up to 2.4 MHz):
+- **Tune:** tap the waterfall to tune, snapping to the mode's channel step. Pinch to zoom, drag to pan,
+  and double-tap to zoom in or out. At deep zoom the waterfall switches to a high-resolution view around
+  the tuned channel. Drag the yellow tuning line to tune by hand. Tap the frequency to type one
+  (`145.5`, `7074k`, `446006.25k`), or drag it sideways to step.
+- **Modes:** AM, NFM, WFM (mono), USB, LSB and CW.
+- **Squelch and cleanup:** the squelch slider works like a radio's (dB over the noise floor). A
+  separate *Voice cleanup* switch applies the RNNoise voice cleanup in any mode; it is on by default
+  for AM and NFM.
+- **Settings:** RF gain, span and filter bandwidth; per phone, a low-data mode and playing on with the
+  screen locked.
+- **Bookmarks:** shared by every phone, kept in `bookmarks.json` and drawn on the waterfall. The
+  lock-screen next/previous buttons step through them.
+
+Nothing is recorded in this mode. Everyone connected shares one receiver, and there is no password:
+anyone who can reach the port can retune it, so only serve it on a trusted network (or over a VPN
+such as WireGuard or Tailscale).
+
+Below 28.8 MHz the V4 needs a librtlsdr that knows its HF upconverter (the RTL-SDR Blog fork does).
+
+### Recordings
 
 Recordings go to `recordings/YYYY-MM-DD/<freq>_<UTC time>_<seconds>s.wav`. One line per transmission
 (kept or dropped, with the reason) is appended to `recordings/log.jsonl`.
