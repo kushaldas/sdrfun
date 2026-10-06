@@ -1,17 +1,20 @@
-//! `--serve`: a small web page plus a WebSocket that streams the cleaned audio
-//! (what the speaker plays) and live status, for listening on a phone.
+//! Web serving for phones. `Hub` is a small HTTP server for one page plus a WebSocket at
+//! `/ws`; `Streamer` uses it for `listen --serve`, `web.rs` for `sdrfun web`.
 //!
-//! WebSocket `/ws`: binary messages are mono 16-bit little-endian PCM at
-//! `STREAM_RATE`; text messages are JSON events (`status`, `open`, `tx`). A new
-//! client first receives every `tx` event of the run so far. Saved transmissions
-//! carry a `url` (`/rec/<n>.wav`) that serves the recording, with byte ranges
-//! as iOS Safari requires for audio.
+//! `Streamer`: binary messages are mono 16-bit little-endian PCM at `STREAM_RATE`; text
+//! messages are JSON events (`status`, `open`, `tx`). A new client first receives every
+//! `tx` event of the run so far. Saved transmissions carry a `url` (`/rec/<n>.wav`) that
+//! serves the recording, with byte ranges as iOS Safari requires for audio.
+//!
+//! Clients may send JSON text messages; `{"cmd": "lowdata", "on": bool}` is handled per
+//! client (fewer waterfall rows, `WATERFALL_TYPES`), everything else is forwarded to the
+//! hub's inbound channel.
 
-use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -25,20 +28,29 @@ use crate::dsp::resample::Resampler;
 /// Streamed sample rate. Older iOS Safari rejects Web Audio buffers below 22.05 kHz.
 pub const STREAM_RATE: u32 = 24_000;
 /// Audio is sent in pieces of this many samples (100 ms).
-const CHUNK: usize = STREAM_RATE as usize / 10;
+pub const CHUNK: usize = STREAM_RATE as usize / 10;
 /// Messages queued per client before it is considered too slow and audio is dropped.
 const CLIENT_QUEUE: usize = 64;
 /// Transmission events replayed to a newly connected page.
 const HISTORY: usize = 500;
 const PAGE: &str = include_str!("serve.html");
+/// Binary message types (first byte) that "low data" clients receive only some of.
+pub const WATERFALL_TYPES: [u8; 2] = [2, 3];
+/// A low-data client gets one in this many waterfall rows.
+const LOWDATA_EVERY: u32 = 4;
+/// How long a client thread waits for input before sending what is queued.
+const POLL: Duration = Duration::from_millis(10);
 
-#[derive(Default)]
 struct Shared {
+    page: &'static str,
     clients: Vec<SyncSender<Message>>,
     /// `tx` events of this run, oldest first.
     history: VecDeque<String>,
+    /// Latest message of each kind (e.g. receiver state), sent to every new client.
+    latest: BTreeMap<String, String>,
     /// Recordings that may be served, indexed by the number in their URL.
     files: Vec<PathBuf>,
+    inbound: Option<Sender<serde_json::Value>>,
 }
 
 type SharedRef = Arc<Mutex<Shared>>;
@@ -47,20 +59,30 @@ fn lock(shared: &SharedRef) -> std::sync::MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub struct Streamer {
+/// HTTP + WebSocket server for one page; clone it to share between threads.
+#[derive(Clone)]
+pub struct Hub {
     shared: SharedRef,
-    resampler: Resampler,
-    scratch: Vec<f32>,
-    pending: Vec<i16>,
 }
 
-impl Streamer {
-    /// Start listening on `addr` (e.g. "0.0.0.0:8010"); returns the streamer and the
-    /// URL to open on another device.
-    pub fn start(addr: &str) -> Result<(Self, String)> {
+impl Hub {
+    /// Start listening on `addr` (e.g. "0.0.0.0:8010"); returns the hub and the URL to open
+    /// on another device. Client JSON messages go to `inbound`.
+    pub fn start(
+        addr: &str,
+        page: &'static str,
+        inbound: Option<Sender<serde_json::Value>>,
+    ) -> Result<(Self, String)> {
         let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         let local = listener.local_addr()?;
-        let shared = SharedRef::default();
+        let shared = Arc::new(Mutex::new(Shared {
+            page,
+            clients: Vec::new(),
+            history: VecDeque::new(),
+            latest: BTreeMap::new(),
+            files: Vec::new(),
+            inbound,
+        }));
         {
             let shared = shared.clone();
             thread::spawn(move || {
@@ -72,13 +94,51 @@ impl Streamer {
                 }
             });
         }
+        Ok((Self { shared }, browse_url(local)))
+    }
+
+    pub fn clients(&self) -> usize {
+        lock(&self.shared).clients.len()
+    }
+
+    /// Send a JSON event to every client.
+    pub fn event(&self, value: serde_json::Value) {
+        broadcast(&mut lock(&self.shared), Message::Text(value.to_string().into()));
+    }
+
+    /// Send a JSON event to every client and remember it as the latest of its `kind`, so
+    /// clients that connect later get it too.
+    pub fn latest(&self, kind: &str, value: serde_json::Value) {
+        let text = value.to_string();
+        let mut shared = lock(&self.shared);
+        shared.latest.insert(kind.to_string(), text.clone());
+        broadcast(&mut shared, Message::Text(text.into()));
+    }
+
+    pub fn binary(&self, data: Vec<u8>) {
+        broadcast(&mut lock(&self.shared), Message::Binary(data.into()));
+    }
+}
+
+pub struct Streamer {
+    hub: Hub,
+    resampler: Resampler,
+    scratch: Vec<f32>,
+    pending: Vec<i16>,
+}
+
+impl Streamer {
+    /// Start listening on `addr` (e.g. "0.0.0.0:8010"); returns the streamer and the
+    /// URL to open on another device.
+    pub fn start(addr: &str) -> Result<(Self, String)> {
+        let (hub, url) = Hub::start(addr, PAGE, None)?;
         let streamer = Self {
-            shared,
+            hub,
             resampler: Resampler::new(SAMPLE_RATE, STREAM_RATE),
             scratch: Vec::new(),
             pending: Vec::with_capacity(CHUNK),
         };
-        Ok((streamer, browse_url(local)))
+        Ok((streamer, url))
     }
 
     /// Queue 48 kHz audio for every connected listener.
@@ -87,7 +147,7 @@ impl Streamer {
         scratch.clear();
         self.resampler.process(audio, &mut scratch);
         for &s in &scratch {
-            self.pending.push((s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16);
+            self.pending.push(to_i16(s));
             if self.pending.len() == CHUNK {
                 self.send_pending();
             }
@@ -104,13 +164,13 @@ impl Streamer {
 
     /// Send a JSON event to every listener.
     pub fn event(&self, value: serde_json::Value) {
-        broadcast(&mut lock(&self.shared), Message::Text(value.to_string().into()));
+        self.hub.event(value);
     }
 
     /// Announce a finished transmission, remembered for pages that connect later.
     /// If it was saved to `file`, the event gets a `url` that plays it.
     pub fn transmission(&self, mut event: serde_json::Value, file: Option<&Path>) {
-        let mut shared = lock(&self.shared);
+        let mut shared = lock(&self.hub.shared);
         if let Some(path) = file {
             shared.files.push(path.to_owned());
             event["url"] = serde_json::json!(format!("/rec/{}.wav", shared.files.len() - 1));
@@ -126,8 +186,13 @@ impl Streamer {
     fn send_pending(&mut self) {
         let bytes: Vec<u8> = self.pending.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.pending.clear();
-        broadcast(&mut lock(&self.shared), Message::Binary(bytes.into()));
+        self.hub.binary(bytes);
     }
+}
+
+/// Audio sample in [-1, 1] as 16-bit PCM.
+pub fn to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
 }
 
 fn broadcast(shared: &mut Shared, msg: Message) {
@@ -151,23 +216,26 @@ fn handle(stream: TcpStream, shared: SharedRef) -> Result<()> {
         let mut ws =
             tungstenite::accept(stream).map_err(|e| anyhow::anyhow!("websocket handshake: {e}"))?;
         let (tx, rx) = sync_channel(CLIENT_QUEUE);
-        // Copy the history and register in one step, so no event is missed or doubled.
-        let history: Vec<String> = {
+        // Copy the greeting and register in one step, so no event is missed or doubled.
+        let (greeting, inbound) = {
             let mut shared = lock(&shared);
             shared.clients.push(tx);
-            shared.history.iter().cloned().collect()
+            let greeting: Vec<String> =
+                shared.latest.values().chain(shared.history.iter()).cloned().collect();
+            (greeting, shared.inbound.clone())
         };
-        for text in history {
+        for text in greeting {
             ws.send(Message::Text(text.into()))?;
         }
-        pump(ws, rx);
+        pump(ws, rx, inbound);
         return Ok(());
     }
 
     let mut stream = stream;
     let request = read_request(&mut stream)?;
     if path == "/" || path.starts_with("/?") {
-        return respond(&mut stream, "200 OK", "text/html; charset=utf-8", &[], PAGE.as_bytes());
+        let page = lock(&shared).page;
+        return respond(&mut stream, "200 OK", "text/html; charset=utf-8", &[], page.as_bytes());
     }
     if let Some(data) = recording(&shared, &path).and_then(|f| std::fs::read(f).ok()) {
         return serve_bytes(&mut stream, &request, "audio/wav", &data);
@@ -239,11 +307,52 @@ fn respond(stream: &mut TcpStream, status: &str, kind: &str, extra: &[String], b
     Ok(())
 }
 
-/// Forward queued messages to one WebSocket client until it goes away.
-fn pump(mut ws: tungstenite::WebSocket<TcpStream>, rx: Receiver<Message>) {
-    for msg in rx {
-        if ws.send(msg).is_err() {
-            break;
+/// Exchange messages with one WebSocket client until it goes away: forward its JSON
+/// messages to `inbound` and send it what is queued for it.
+fn pump(
+    mut ws: tungstenite::WebSocket<TcpStream>,
+    rx: Receiver<Message>,
+    inbound: Option<Sender<serde_json::Value>>,
+) {
+    if ws.get_ref().set_read_timeout(Some(POLL)).is_err() {
+        return;
+    }
+    let mut lowdata = false;
+    let mut rows = 0u32;
+    loop {
+        match ws.read() {
+            Ok(Message::Text(text)) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+                if value["cmd"] == "lowdata" {
+                    lowdata = value["on"].as_bool().unwrap_or(false);
+                } else if let Some(inbound) = &inbound {
+                    let _ = inbound.send(value);
+                }
+            }
+            Ok(Message::Close(_)) => return,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return,
+        }
+        loop {
+            let msg = match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            };
+            if let Message::Binary(b) = &msg
+                && lowdata
+                && b.first().is_some_and(|t| WATERFALL_TYPES.contains(t))
+            {
+                rows = rows.wrapping_add(1);
+                if !rows.is_multiple_of(LOWDATA_EVERY) {
+                    continue;
+                }
+            }
+            if ws.send(msg).is_err() {
+                return;
+            }
         }
     }
 }
@@ -292,7 +401,7 @@ mod tests {
         .unwrap();
         // Wait until the server has registered the client.
         for _ in 0..100 {
-            if !lock(&streamer.shared).clients.is_empty() {
+            if streamer.hub.clients() > 0 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -378,5 +487,50 @@ mod tests {
             assert!(status.contains("404"), "{path}: {status}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hub_forwards_commands_greets_late_clients_and_thins_rows_for_low_data() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (hub, url) = Hub::start("127.0.0.1:0", "<title>t</title>", Some(tx)).unwrap();
+        let addr = url.trim_start_matches("http://").trim_end_matches('/').to_string();
+        hub.latest("state", serde_json::json!({"type": "state", "hz": 1}));
+        hub.latest("state", serde_json::json!({"type": "state", "hz": 2}));
+
+        let connect = || {
+            tungstenite::client::client(format!("ws://{addr}/ws"), TcpStream::connect(&addr).unwrap())
+                .unwrap()
+                .0
+        };
+        let mut a = connect();
+        let mut b = connect();
+        for ws in [&mut a, &mut b] {
+            let Message::Text(t) = ws.read().unwrap() else { panic!("expected state") };
+            assert!(t.contains("\"hz\":2"), "only the latest state: {t}");
+        }
+
+        a.send(Message::Text(r#"{"cmd":"tune","hz":145500000}"#.into())).unwrap();
+        let cmd = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(cmd["hz"], 145_500_000);
+
+        b.send(Message::Text(r#"{"cmd":"lowdata","on":true}"#.into())).unwrap();
+        // The lowdata command is handled by the client thread, not forwarded.
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        for _ in 0..8 {
+            hub.binary(vec![2, 0, 0]);
+        }
+        hub.binary(vec![1, 9]);
+        let count_rows = |ws: &mut tungstenite::WebSocket<TcpStream>| {
+            let mut rows = 0;
+            loop {
+                match ws.read().unwrap() {
+                    Message::Binary(m) if m[0] == 2 => rows += 1,
+                    Message::Binary(m) if m[0] == 1 => return rows,
+                    _ => {}
+                }
+            }
+        };
+        assert_eq!(count_rows(&mut a), 8);
+        assert_eq!(count_rows(&mut b), 8 / LOWDATA_EVERY as usize);
     }
 }

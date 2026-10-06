@@ -2,7 +2,7 @@
 name = "sdrfun"
 version = "0.1.0"
 edition = "2024"
-description = "Listen to AM airband voice on an RTL-SDR, clean it up, play and record it"
+description = "Listen to voice on an RTL-SDR: clean it up, play and record it, or tune it from a phone"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/kushaldas/sdrfun"
 readme = "README.md"
@@ -18,6 +18,7 @@ ctrlc = "3.5.2"
 hound = "3.5.1"
 nnnoiseless = "0.5.2"
 rustfft = "6.4.1"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 

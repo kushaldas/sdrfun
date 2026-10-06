@@ -1,0 +1,1079 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#07090c">
+<title>sdrfun receiver</title>
+<style>
+  :root {
+    --ink: #07090c; --panel: #0d1116; --panel2: #121820; --line: #1e2731; --text: #d9e2eb; --dim: #6f7e8e;
+    --amber: #ffb547; --amber-dim: #6b4a17; --teal: #3fe0c5; --red: #ff5d5d;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --r: 12px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text); font: 15px/1.35 var(--sans);
+    overflow: hidden; overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+  }
+  .app {
+    height: 100vh; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  }
+
+  /* ── readout ─────────────────────────────────────────── */
+  header { padding: 10px 14px 8px; background: linear-gradient(#0b0f14, var(--ink)); border-bottom: 1px solid var(--line); }
+  .row1 { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .readout {
+    position: relative; flex: 1; min-width: 0; padding: 4px 10px 2px; border-radius: 10px; touch-action: none;
+    background: radial-gradient(120% 140% at 50% 0%, #1a1306 0%, #0a0806 70%); border: 1px solid #2a2010;
+    font: 600 clamp(2rem, 10.5vw, 2.9rem)/1.05 var(--mono); letter-spacing: -0.03em; color: var(--amber);
+    text-shadow: 0 0 10px rgba(255,181,71,.45), 0 0 2px rgba(255,181,71,.9); font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; cursor: ew-resize;
+  }
+  .readout::after { /* faint scanlines, like a VFD behind glass */
+    content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: inherit;
+    background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px);
+  }
+  .readout .hz { font-size: .55em; opacity: .75; letter-spacing: 0; }
+  .readout .unit { font: 600 .7rem var(--sans); color: var(--amber-dim); margin-left: 4px; letter-spacing: .08em; text-shadow: none; }
+  .readout.drag { border-color: var(--amber); }
+  .readout input { /* the text box: invisible over the display until tapped */
+    position: absolute; inset: 0; width: 100%; padding: 4px 10px 2px; border: 0; outline: 0; background: transparent;
+    font: inherit; letter-spacing: inherit; color: inherit; text-shadow: inherit; opacity: 0; caret-color: var(--amber);
+    -webkit-user-select: text; user-select: text;
+  }
+  .readout.editing { border-color: var(--amber); box-shadow: 0 0 0 3px rgba(255,181,71,.18); }
+  .readout.editing input { opacity: 1; }
+  .readout.editing .show { visibility: hidden; }
+  .side { display: grid; justify-items: end; gap: 4px; }
+  .modetag { font: 700 .8rem var(--mono); color: var(--ink); background: var(--amber); border-radius: 5px; padding: 2px 7px; letter-spacing: .06em; }
+  .conn { display: inline-flex; align-items: center; gap: 5px; font-size: .7rem; color: var(--dim); }
+  .conn i { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
+  .conn.on i { background: var(--teal); box-shadow: 0 0 8px var(--teal); }
+  .bmname { font-size: .78rem; color: var(--dim); margin-top: 4px; height: 1.1em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+  .meter { position: relative; margin-top: 6px; height: 10px; border-radius: 5px; background: #0f141a; overflow: hidden; border: 1px solid var(--line); }
+  .meter .bar { position: absolute; inset: 0 auto 0 0; width: 0; background: linear-gradient(90deg, #1b6c61, var(--teal)); transition: width .12s linear; }
+  .meter.closed .bar { background: linear-gradient(90deg, #26313c, #4b5a68); }
+  .meter .sql { position: absolute; top: -1px; bottom: -1px; width: 2px; background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+  .levels .clip { color: var(--red); font-weight: 700; }
+  .levels { display: flex; justify-content: space-between; font: .72rem var(--mono); color: var(--dim); margin-top: 3px; font-variant-numeric: tabular-nums; }
+
+  /* ── display ─────────────────────────────────────────── */
+  .display { position: relative; display: grid; grid-template-rows: 92px minmax(0, 1fr); min-height: 0; overflow: hidden; background: #030406; touch-action: none; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #wf { image-rendering: pixelated; }
+  .tuneline { position: absolute; top: 0; bottom: 0; width: 0; pointer-events: none; }
+  .tuneline::before { /* the line through the waterfall */
+    content: ""; position: absolute; top: 92px; bottom: 0; left: -0.5px; width: 1px; background: rgba(255,181,71,.55);
+  }
+  .tuneline i { /* grip at the bottom of the spectrum: drag it to tune */
+    position: absolute; top: 74px; left: -15px; width: 30px; height: 18px; border-radius: 9px;
+    background: var(--amber); box-shadow: 0 0 10px rgba(255,181,71,.5);
+    display: grid; place-items: center; color: var(--ink); font: 700 11px/1 var(--sans);
+  }
+  .tuneline i::after { content: "⇔"; }
+  .tuneline.drag i { transform: scale(1.25); }
+  .zoomtag {
+    position: absolute; right: 8px; top: 98px; font: .7rem var(--mono); color: var(--dim);
+    background: rgba(7,9,12,.75); border: 1px solid var(--line); padding: 2px 6px; border-radius: 6px; pointer-events: none;
+  }
+  .zoomtag.detail { color: var(--amber); border-color: var(--amber-dim); }
+
+  /* ── controls ────────────────────────────────────────── */
+  .controls {
+    background: var(--panel); border-top: 1px solid var(--line); display: grid; gap: 10px;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+  .modes { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+  .chip {
+    height: 40px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+    font: 700 .82rem var(--mono); letter-spacing: .04em;
+  }
+  .chip.on { background: var(--amber); color: var(--ink); border-color: var(--amber); box-shadow: 0 0 14px rgba(255,181,71,.25); }
+  .tune { display: grid; grid-template-columns: 52px 1fr 52px; gap: 8px; align-items: center; }
+  .btn {
+    height: 48px; border-radius: var(--r); border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+    font: 600 1rem var(--sans); display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .btn:active, .chip:active { transform: translateY(1px); filter: brightness(1.25); }
+  .sqlbox { display: grid; gap: 2px; }
+  .sqlbox .lbl { display: flex; justify-content: space-between; font: .72rem var(--mono); color: var(--dim); }
+  input[type=range] { width: 100%; height: 30px; accent-color: var(--amber); margin: 0; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr 48px 1.4fr; gap: 8px; }
+  .toggle { justify-content: flex-start; padding: 0 10px; font-size: .82rem; text-align: left; line-height: 1.1; }
+  .toggle .sw { flex: none; width: 30px; height: 18px; border-radius: 9px; background: #26303a; position: relative; transition: background .15s; }
+  .toggle .sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #9aa7b4; transition: transform .15s, background .15s; }
+  .toggle.on .sw { background: #134a43; }
+  .toggle.on .sw::after { transform: translateX(12px); background: var(--teal); }
+  .play { background: var(--teal); color: #032019; border: 0; font-weight: 800; font-size: 1.05rem; letter-spacing: .02em; }
+  .play.stop { background: #1b232c; color: var(--text); border: 1px solid var(--line); }
+
+  /* ── sheets ──────────────────────────────────────────── */
+  .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 10; }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 11; max-height: 82dvh; overflow: auto; -webkit-user-select: text; user-select: text;
+    background: var(--panel); border-top: 1px solid var(--line); border-radius: 18px 18px 0 0;
+    padding: 8px 16px calc(18px + env(safe-area-inset-bottom)); animation: up .18s ease-out;
+  }
+  @keyframes up { from { transform: translateY(30%); opacity: .4; } }
+  .grab { width: 40px; height: 4px; border-radius: 2px; background: #2c3742; margin: 2px auto 10px; }
+  .sheet h2 { font: 700 .78rem var(--sans); color: var(--dim); letter-spacing: .1em; text-transform: uppercase; margin: 14px 0 8px; }
+  .sheet h2:first-of-type { margin-top: 0; }
+  .field { display: grid; gap: 4px; margin-bottom: 12px; }
+  .field .lbl { display: flex; justify-content: space-between; font-size: .85rem; color: var(--dim); }
+  .field .lbl b { color: var(--text); font: 600 .85rem var(--mono); }
+  .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; }
+  .seg .chip { height: 42px; }
+  .bmlist { list-style: none; margin: 0; padding: 0; }
+  .bmlist li { display: grid; grid-template-columns: 1fr auto 44px; gap: 8px; align-items: center; padding: 4px 0; border-top: 1px solid var(--line); }
+  .bmlist li:first-child { border-top: 0; }
+  .bmlist .go { text-align: left; background: none; border: 0; color: var(--text); padding: 8px 0; min-height: 44px; font: 600 .95rem var(--sans); }
+  .bmlist .go small { display: block; font: .78rem var(--mono); color: var(--dim); font-weight: 400; }
+  .bmlist .go.cur { color: var(--amber); }
+  .bmlist .m { font: 700 .7rem var(--mono); color: var(--dim); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+  .bmlist .del { width: 44px; height: 40px; border-radius: 9px; border: 1px solid var(--line); background: none; color: var(--dim); font-size: 1rem; }
+  .bmlist .del.confirm { background: var(--red); color: #200; border-color: var(--red); font-size: .7rem; font-weight: 700; }
+  .addrow { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 6px; }
+  .addrow input { height: 46px; border-radius: var(--r); border: 1px solid var(--line); background: var(--ink); color: var(--text); padding: 0 12px; font: 16px var(--sans); }
+  .note { color: var(--dim); font-size: .78rem; margin: 10px 0 0; }
+
+
+  .toast {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(220px + env(safe-area-inset-bottom)); z-index: 20;
+    background: #2a1414; color: #ffd0d0; border: 1px solid #5a2323; padding: 8px 14px; border-radius: 10px; font-size: .85rem; max-width: 90vw;
+  }
+
+  /* ── landscape phones: waterfall left, controls in a side rail ── */
+  @media (orientation: landscape) and (max-height: 520px) {
+    .app { grid-template-columns: minmax(0, 1fr) 330px; grid-template-rows: auto minmax(0, 1fr); }
+    header { grid-column: 1; }
+    .display { grid-column: 1; grid-row: 2; }
+    .controls { grid-column: 2; grid-row: 1 / 3; border-top: 0; border-left: 1px solid var(--line); align-content: center; overflow: auto;
+                padding-right: calc(12px + env(safe-area-inset-right)); }
+    .readout { font-size: 2rem; }
+    .row3 { grid-template-columns: 1fr 1fr; }
+    .toast { bottom: calc(16px + env(safe-area-inset-bottom)); left: 35%; }
+  }
+  @media (min-width: 700px) and (orientation: portrait) {
+    .controls { padding-left: max(12px, calc(50vw - 300px)); padding-right: max(12px, calc(50vw - 300px)); }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="row1">
+      <div class="readout" id="readout">
+        <span class="show"><span id="fmain">---.---</span><span class="hz" id="fhz"></span><span class="unit">MHz</span></span>
+        <input id="fin" type="text" inputmode="decimal" enterkeyhint="go" autocomplete="off" autocorrect="off"
+               spellcheck="false" aria-label="Frequency in MHz (or with k for kHz); drag sideways to step">
+      </div>
+      <div class="side">
+        <span class="modetag" id="modetag">—</span>
+        <span class="conn" id="conn"><i></i><span id="connText">offline</span></span>
+      </div>
+    </div>
+    <div class="bmname" id="bmname"></div>
+    <div class="meter closed" id="meter"><div class="bar" id="bar"></div><div class="sql" id="sqlmark" hidden></div></div>
+    <div class="levels"><span id="lvl">— dBFS</span><span id="above">—</span><span id="floor">floor —</span></div>
+  </header>
+
+  <div class="display" id="display">
+    <canvas id="spec"></canvas>
+    <canvas id="wf"></canvas>
+    <div class="tuneline" id="tuneline" hidden><i></i></div>
+    <span class="zoomtag" id="zoomtag"></span>
+  </div>
+
+  <div class="controls">
+    <div class="modes" id="modes"></div>
+    <div class="tune">
+      <button class="btn" id="down" aria-label="Step down">◀</button>
+      <div class="sqlbox">
+        <div class="lbl"><span id="steplbl">step —</span><span id="sqllbl">SQL off</span></div>
+        <input type="range" id="sql" min="-1" max="40" step="1" value="-1" aria-label="Squelch">
+      </div>
+      <button class="btn" id="up" aria-label="Step up">▶</button>
+    </div>
+    <div class="row3">
+      <button class="btn toggle" id="cleanup"><span class="sw"></span><span>Voice<br>cleanup</span></button>
+      <button class="btn" id="bmbtn">★ Marks</button>
+      <button class="btn" id="setbtn" aria-label="Settings">⚙</button>
+      <button class="btn play" id="play">▶ Play</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+
+<section class="sheet" id="sheet-bm" hidden>
+  <div class="grab"></div>
+  <h2>Add this frequency</h2>
+  <div class="addrow"><input id="bmnew" placeholder="Name" maxlength="60" enterkeyhint="done"><button class="btn" id="bmadd">Add</button></div>
+  <h2>Bookmarks</h2>
+  <ul class="bmlist" id="bmlist"></ul>
+</section>
+
+<section class="sheet" id="sheet-set" hidden>
+  <div class="grab"></div>
+  <h2>Receiver</h2>
+  <div class="field">
+    <div class="lbl"><span>RF gain</span><b id="gainlbl">—</b></div>
+    <input type="range" id="gain" min="0" max="1" step="1" value="0">
+    <button class="btn toggle" id="gainauto"><span class="sw"></span><span>Automatic gain</span></button>
+  </div>
+  <div class="field">
+    <div class="lbl"><span>Span</span><b id="spanlbl">—</b></div>
+    <div class="seg" id="spans"></div>
+  </div>
+  <div class="field">
+    <div class="lbl"><span>Filter bandwidth</span><b id="bwlbl">—</b></div>
+    <input type="range" id="bw" min="0" max="1" step="1" value="0">
+  </div>
+  <h2>This phone</h2>
+  <div class="field">
+    <div class="lbl"><span>Volume</span><b id="vollbl">100 %</b></div>
+    <input type="range" id="volume" min="0" max="3" step="0.05" value="1">
+  </div>
+  <div class="field"><button class="btn toggle" id="lowdata"><span class="sw"></span><span>Low data (fewer waterfall lines)</span></button></div>
+  <div class="field"><button class="btn toggle" id="bg"><span class="sw"></span><span>Keep playing when locked</span></button></div>
+  <p class="note">Everyone connected shares this receiver: tuning here retunes it for all of them.
+    Pinch the waterfall to zoom, drag to pan, tap to tune, double-tap to zoom in or out.
+    Drag the yellow tuning line (or its ⇔ grip) to tune by hand.
+    Tap the frequency to type one (145.5, 7074k or 446006.25k); drag it sideways to step.</p>
+</section>
+
+
+<div class="toast" id="toast" hidden></div>
+<audio id="bgAudio" playsinline></audio>
+
+<script>
+'use strict';
+const RATE = 24000;            // STREAM_RATE in serve.rs
+const LEAD = 0.25;             // seconds buffered when audio (re)starts
+const MAX_LAG = 1.0;           // drop audio once this far ahead (SDR clock faster than the phone's)
+const ROW_HEADER = 19;         // web.rs
+const ROW_SCALE = 64;
+const MAX_ROWS = 1200;
+const $ = (id) => document.getElementById(id);
+
+let S = null;                  // server state
+let bookmarks = [];
+let meter = null;
+let ws = null;
+const view = { center: 0, span: 0 };
+const rows = { 2: [], 3: [] }; // 2 = wideband, 3 = detail around the tuned frequency
+const prefs = loadPrefs();
+
+function loadPrefs() {
+  try { return Object.assign({ volume: 1, lowdata: false, bg: false }, JSON.parse(localStorage.getItem('sdrfun') || '{}')); }
+  catch (_) { return { volume: 1, lowdata: false, bg: false }; }
+}
+function savePrefs() { try { localStorage.setItem('sdrfun', JSON.stringify(prefs)); } catch (_) {} }
+
+// ── IMA ADPCM (adpcm.rs) ────────────────────────────────────────────
+const IDX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+const STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+  73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408,
+  449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+  2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630,
+  9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+function adpcm(b, off, n, out, scale) {
+  let pred = ((b[off] | (b[off + 1] << 8)) << 16) >> 16, idx = b[off + 2];
+  const data = off + 3;
+  for (let i = 0; i < n; i++) {
+    const byte = b[data + (i >> 1)], code = i & 1 ? byte >> 4 : byte & 15, step = STEP[idx];
+    let diff = step >> 3;
+    if (code & 4) diff += step;
+    if (code & 2) diff += step >> 1;
+    if (code & 1) diff += step >> 2;
+    pred += code & 8 ? -diff : diff;
+    if (pred > 32767) pred = 32767; else if (pred < -32768) pred = -32768;
+    idx += IDX[code];
+    if (idx < 0) idx = 0; else if (idx > 88) idx = 88;
+    out[i] = pred * scale;
+  }
+}
+
+// ── formatting ──────────────────────────────────────────────────────
+function fmtMHz(hz, digits = 3) { return (hz / 1e6).toFixed(digits); }
+function fmtHz(hz) {
+  const a = Math.abs(hz);
+  if (a >= 1e6) return +(hz / 1e6).toFixed(3) + 'M';
+  if (a >= 1e3) return +(hz / 1e3).toFixed(2) + 'k';
+  return Math.round(hz) + '';
+}
+function showReadout(hz) {
+  const s = (Math.round(hz) / 1e6).toFixed(6);       // "145.500000"
+  $('fmain').textContent = s.slice(0, -3);
+  $('fhz').textContent = ' ' + s.slice(-3);
+}
+
+// ── connection ──────────────────────────────────────────────────────
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    $('conn').className = 'conn on'; $('connText').textContent = 'live';
+    if (prefs.lowdata) send({ cmd: 'lowdata', on: true });
+  };
+  ws.onmessage = (e) => (typeof e.data === 'string' ? onEvent(JSON.parse(e.data)) : onBinary(new Uint8Array(e.data)));
+  ws.onclose = () => {
+    $('conn').className = 'conn'; $('connText').textContent = 'reconnecting';
+    setTimeout(connect, 2000);
+  };
+}
+
+function onEvent(ev) {
+  if (ev.type === 'state') onState(ev);
+  else if (ev.type === 'meter') onMeter(ev);
+  else if (ev.type === 'bookmarks') { bookmarks = ev.items; renderBookmarks(); updateTitle(); dirty(true); }
+  else if (ev.type === 'error') toast(ev.message);
+}
+
+function onBinary(b) {
+  if (b[0] === 1) return onAudio(b);
+  if (b[0] !== 2 && b[0] !== 3) return;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const bins = dv.getUint16(17, true);
+  const levels = new Uint8ClampedArray(bins);   // ADPCM can overshoot 0..255 slightly
+  adpcm(b, ROW_HEADER, bins, levels, 1 / ROW_SCALE);
+  const list = rows[b[0]];
+  list.unshift({ center: dv.getUint32(1, true), span: dv.getUint32(5, true), bins, levels });
+  if (list.length > MAX_ROWS) list.length = MAX_ROWS;
+  if ((b[0] === 3) === useDetail()) newRow = true;
+  dirty(false);
+}
+
+// ── state ───────────────────────────────────────────────────────────
+function onState(s) {
+  const first = !S;
+  const prev = S;
+  S = s;
+  // A drag has finished once the server reports the frequency it ended on.
+  if (dragHz !== null && gesture?.type !== 'tune' && Math.abs(s.hz - dragHz) < 1) dragHz = null;
+  showReadout(tunedHz());
+  $('modetag').textContent = s.mode.toUpperCase();
+  if (!$('modes').children.length) {
+    for (const m of s.modes) {
+      const b = document.createElement('button');
+      b.className = 'chip'; b.textContent = m.name.toUpperCase(); b.dataset.mode = m.name;
+      b.onclick = () => { haptic(); send({ cmd: 'mode', mode: m.name }); };
+      $('modes').appendChild(b);
+    }
+    $('spans').innerHTML = '';
+    for (const r of s.spans) {
+      const b = document.createElement('button');
+      b.className = 'chip'; b.textContent = +(r / 1e6).toFixed(2) + ''; b.dataset.rate = r;
+      b.onclick = () => send({ cmd: 'span', rate: r });
+      $('spans').appendChild(b);
+    }
+  }
+  for (const b of $('modes').children) b.classList.toggle('on', b.dataset.mode === s.mode);
+  for (const b of $('spans').children) b.classList.toggle('on', +b.dataset.rate === s.rate);
+  $('spanlbl').textContent = fmtMHz(s.rate, 2) + ' MHz';
+  $('steplbl').textContent = 'step ' + fmtHz(s.step_hz);
+  setSquelchUi(s.squelch);
+  setToggle('cleanup', s.cleanup);
+
+  // Gain: slider over the tuner's steps.
+  const g = $('gain');
+  g.max = Math.max(0, s.gains.length - 1);
+  setToggle('gainauto', s.gain === null);
+  g.disabled = s.gain === null;
+  if (s.gain !== null && !g.matches(':active')) g.value = nearestIndex(s.gains, s.gain);
+  $('gainlbl').textContent = s.gain === null ? 'auto' : s.gain.toFixed(1) + ' dB';
+
+  // Bandwidth: 40 log-spaced steps over the mode's range.
+  bwRange = [s.bandwidth_min, s.bandwidth_max];
+  $('bw').max = 40;
+  if (!$('bw').matches(':active')) $('bw').value = bwToSlider(s.bandwidth);
+  $('bwlbl').textContent = fmtHz(s.bandwidth) + 'Hz';
+
+  // View: start on the whole band, and follow the receiver when it moves out of sight.
+  if (first || view.span > s.rate || !prev || prev.rate !== s.rate) { view.span = s.rate; view.center = s.center_hz; }
+  if (s.hz < view.center - view.span / 2 || s.hz > view.center + view.span / 2) view.center = s.hz;
+  clampView();
+  renderBookmarks();
+  updateTitle();
+  dirty(true);
+}
+
+function onMeter(m) {
+  meter = m;
+  // Before the floor is known (tuned in on a carrier), show the carrier's prominence.
+  const above = m.floor_db == null ? m.carrier_db ?? 0 : m.level_db - m.floor_db;
+  $('bar').style.width = Math.max(0, Math.min(100, above * 2.5)) + '%';
+  $('meter').className = 'meter' + (m.open ? '' : ' closed');
+  $('lvl').textContent = m.level_db.toFixed(1) + ' dBFS';
+  $('above').textContent = (above >= 0 ? '+' : '') + above.toFixed(1) + ' dB';
+  $('floor').textContent = m.floor_db == null ? 'floor —' : 'floor ' + m.floor_db.toFixed(1);
+  // Show ADC clipping in place of the level, so the gain can be lowered.
+  const clip = m.clip > 0.0005;
+  $('lvl').classList.toggle('clip', clip);
+  if (clip) $('lvl').textContent = 'ADC CLIP ' + (m.clip * 100).toFixed(1) + '% · lower gain';
+}
+
+function setSquelchUi(db) {
+  const sql = $('sql');
+  if (!sql.matches(':active')) sql.value = db == null ? -1 : Math.round(db);
+  $('sqllbl').textContent = db == null ? 'SQL off' : 'SQL ' + Math.round(db) + ' dB';
+  const mark = $('sqlmark');
+  mark.hidden = db == null;
+  if (db != null) mark.style.left = Math.min(100, db * 2.5) + '%';
+}
+
+let bwRange = [1000, 40000];
+function bwToSlider(bw) { return Math.round(40 * Math.log(bw / bwRange[0]) / Math.log(bwRange[1] / bwRange[0])); }
+function sliderToBw(v) {
+  const bw = bwRange[0] * Math.pow(bwRange[1] / bwRange[0], v / 40);
+  const q = bw >= 20000 ? 1000 : bw >= 2000 ? 100 : 10;
+  return Math.min(bwRange[1], Math.max(bwRange[0], Math.round(bw / q) * q));
+}
+function nearestIndex(list, v) {
+  let best = 0;
+  list.forEach((x, i) => { if (Math.abs(x - v) < Math.abs(list[best] - v)) best = i; });
+  return best;
+}
+function setToggle(id, on) { $(id).classList.toggle('on', !!on); }
+
+// ── tuning helpers ──────────────────────────────────────────────────
+function snap(hz) { const st = S.step_hz; return Math.round(hz / st) * st; }
+function tune(hz) { if (S) send({ cmd: 'tune', hz: Math.round(hz) }); }
+function stepBy(n) { if (!S) return; haptic(); tune(snap(S.hz) + n * S.step_hz); }
+function haptic() { try { navigator.vibrate?.(8); } catch (_) {} }
+
+function currentBookmark() {
+  if (!S) return null;
+  return bookmarks.find((b) => Math.abs(b.hz - S.hz) < Math.max(1, S.step_hz / 2) && b.mode === S.mode) || null;
+}
+function goBookmark(b) {
+  haptic();
+  const cmd = { cmd: 'tune', hz: b.hz, mode: b.mode };
+  if (b.bandwidth != null) cmd.bandwidth = b.bandwidth;
+  if (b.squelch != null) cmd.squelch = b.squelch;
+  send(cmd);
+}
+function nextBookmark(dir) {
+  if (!S || !bookmarks.length) return;
+  const sorted = [...bookmarks].sort((a, b) => a.hz - b.hz);
+  const b = dir > 0 ? sorted.find((x) => x.hz > S.hz + 1) || sorted[0]
+                    : [...sorted].reverse().find((x) => x.hz < S.hz - 1) || sorted[sorted.length - 1];
+  goBookmark(b);
+}
+
+// ── waterfall + spectrum ────────────────────────────────────────────
+const spec = $('spec'), wf = $('wf');
+const sctx = spec.getContext('2d'), wctx = wf.getContext('2d');
+let wfImg = null, needFull = true, newRow = false, frameQueued = false, lastSrc = null;
+const LUT = makePalette([[0, '#04060a'], [0.22, '#0a1a3f'], [0.42, '#13527d'], [0.58, '#1cae9c'],
+                         [0.74, '#e7c246'], [0.88, '#ff7a3d'], [1, '#fff3df']]);
+
+function makePalette(stops) {
+  const lut = new Uint32Array(256);
+  const rgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 0;
+    while (k < stops.length - 2 && t > stops[k + 1][0]) k++;
+    const [t0, c0] = stops[k], [t1, c1] = stops[k + 1];
+    const f = Math.min(1, Math.max(0, (t - t0) / (t1 - t0)));
+    const a = rgb(c0), b = rgb(c1);
+    const [r, g, bl] = a.map((v, j) => Math.round(v + (b[j] - v) * f));
+    lut[i] = (255 << 24) | (bl << 16) | (g << 8) | r;   // little-endian RGBA
+  }
+  return lut;
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  spec.width = Math.round(spec.clientWidth * dpr); spec.height = Math.round(spec.clientHeight * dpr);
+  // The waterfall is drawn at CSS-pixel resolution: one line per row, cheap to redraw.
+  wf.width = Math.max(1, Math.round(wf.clientWidth)); wf.height = Math.max(1, Math.round(wf.clientHeight));
+  wfImg = wctx.createImageData(wf.width, wf.height);
+  dirty(true);
+}
+
+function useDetail() {
+  const d = rows[3][0];
+  if (!d || !S) return false;
+  return view.span <= d.span * 0.9 && Math.abs(view.center - d.center) + view.span / 2 <= d.span / 2;
+}
+
+function dirty(full) {
+  if (full) needFull = true;
+  if (!frameQueued) { frameQueued = true; requestAnimationFrame(draw); }
+}
+
+function clampView() {
+  if (!S) return;
+  const minSpan = 4000;
+  view.span = Math.min(S.rate, Math.max(minSpan, view.span));
+  const lo = S.center_hz - S.rate / 2 + view.span / 2, hi = S.center_hz + S.rate / 2 - view.span / 2;
+  view.center = Math.min(hi, Math.max(lo, view.center));
+}
+
+function xToHz(x, width) { return view.center - view.span / 2 + (x / width) * view.span; }
+function hzToX(hz, width) { return ((hz - (view.center - view.span / 2)) / view.span) * width; }
+
+/** Paint one waterfall line from a row, taking the strongest bin under each pixel. */
+function paintRow(buf, y, W, r) {
+  const start = r.center - r.span / 2, perHz = r.bins / r.span;
+  const b0 = (view.center - view.span / 2 - start) * perHz, db = (view.span / W) * perHz;
+  const lv = r.levels, n = r.bins, base = y * W;
+  for (let x = 0; x < W; x++) {
+    const a = b0 + x * db;
+    let i = Math.floor(a);
+    if (i < 0 || i >= n) { buf[base + x] = LUT[0]; continue; }
+    let v = lv[i];
+    const end = Math.min(n, Math.floor(a + db));
+    for (i++; i < end; i++) if (lv[i] > v) v = lv[i];
+    buf[base + x] = LUT[v];
+  }
+}
+
+function draw() {
+  frameQueued = false;
+  if (!wfImg || !S) return;
+  const W = wf.width, H = wf.height;
+  const detail = useDetail();
+  const src = rows[detail ? 3 : 2];
+  if (lastSrc !== detail) { needFull = true; lastSrc = detail; }
+  const buf = new Uint32Array(wfImg.data.buffer);
+  if (needFull) {
+    buf.fill(LUT[0]);
+    for (let y = 0; y < Math.min(H, src.length); y++) paintRow(buf, y, W, src[y]);
+    wctx.putImageData(wfImg, 0, 0);
+  } else if (newRow && src.length) {
+    buf.copyWithin(W, 0, W * (H - 1));
+    paintRow(buf, 0, W, src[0]);
+    wctx.putImageData(wfImg, 0, 0);
+  }
+  needFull = false; newRow = false;
+  drawSpectrum(src[0], detail);
+  const line = $('tuneline'), lx = hzToX(tunedHz(), display.clientWidth);
+  line.hidden = lx < 0 || lx > display.clientWidth;
+  line.style.left = lx + 'px';
+  const tag = $('zoomtag');
+  tag.textContent = (detail ? 'detail · ' : '') + fmtHz(view.span) + 'Hz';
+  tag.className = 'zoomtag' + (detail ? ' detail' : '');
+}
+
+function niceStep(span, ticks) {
+  const raw = span / ticks, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  return [1, 2, 5, 10].map((m) => m * p).find((s) => s >= raw);
+}
+
+/** The frequency to show: the one being dragged to, until the server confirms it. */
+function tunedHz() { return dragHz ?? S.hz; }
+
+function passband() {
+  const bw = S.bandwidth, hz = tunedHz();
+  if (S.mode === 'usb') return [hz + 300, hz + 300 + bw];
+  if (S.mode === 'lsb') return [hz - 300 - bw, hz - 300];
+  return [hz - bw / 2, hz + bw / 2];
+}
+
+function drawSpectrum(r, detail) {
+  const W = spec.width, H = spec.height, dpr = window.devicePixelRatio || 1;
+  sctx.clearRect(0, 0, W, H);
+  const g = sctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0b1016'); g.addColorStop(1, '#040507');
+  sctx.fillStyle = g; sctx.fillRect(0, 0, W, H);
+
+  // Frequency grid and labels.
+  const step = niceStep(view.span, Math.max(3, Math.round(W / dpr / 90)));
+  const digits = Math.max(0, Math.min(6, Math.ceil(-Math.log10(step / 1e6))));
+  sctx.font = `${10 * dpr}px ui-monospace, Menlo, monospace`;
+  sctx.textAlign = 'center';
+  for (let f = Math.ceil((view.center - view.span / 2) / step) * step; f <= view.center + view.span / 2; f += step) {
+    const x = hzToX(f, W);
+    sctx.fillStyle = '#18202a'; sctx.fillRect(x, 0, dpr, H - 14 * dpr);
+    sctx.fillStyle = '#5d6b79'; sctx.fillText(fmtMHz(f, digits), x, H - 3 * dpr);
+  }
+
+  // Passband and tuned frequency.
+  const [lo, hi] = passband();
+  const x0 = hzToX(lo, W), x1 = hzToX(hi, W), xt = hzToX(tunedHz(), W);
+  sctx.fillStyle = 'rgba(255,181,71,0.16)';
+  sctx.fillRect(x0, 0, Math.max(dpr, x1 - x0), H - 14 * dpr);
+  sctx.fillStyle = '#ffb547'; sctx.fillRect(xt - dpr / 2, 0, dpr, H - 14 * dpr);
+
+  // Spectrum trace.
+  if (r) {
+    const top = 22 * dpr, bottom = H - 16 * dpr, h = bottom - top;
+    const start = r.center - r.span / 2, perHz = r.bins / r.span;
+    const cols = Math.round(W / dpr);
+    sctx.beginPath();
+    for (let c = 0; c <= cols; c++) {
+      const fa = xToHz(c * dpr, W), fb = xToHz((c + 1) * dpr, W);
+      let a = Math.floor((fa - start) * perHz), b = Math.max(a + 1, Math.floor((fb - start) * perHz));
+      let v = 0;
+      for (let i = Math.max(0, a); i < Math.min(r.bins, b); i++) if (r.levels[i] > v) v = r.levels[i];
+      const y = bottom - (v / 255) * h;
+      if (c === 0) sctx.moveTo(0, y); else sctx.lineTo(c * dpr, y);
+    }
+    sctx.strokeStyle = detail ? '#ffcf80' : '#7fe9d8';
+    sctx.lineWidth = 1.2 * dpr; sctx.stroke();
+    sctx.lineTo(W, bottom); sctx.lineTo(0, bottom); sctx.closePath();
+    sctx.fillStyle = detail ? 'rgba(255,181,71,0.10)' : 'rgba(63,224,197,0.10)';
+    sctx.fill();
+  }
+
+  // Bookmark flags along the top, skipping ones that would overlap.
+  sctx.textAlign = 'left';
+  sctx.font = `600 ${10 * dpr}px -apple-system, system-ui, sans-serif`;
+  let lastEnd = -Infinity;
+  bookmarkHits = [];
+  for (const b of [...bookmarks].sort((a, c) => a.hz - c.hz)) {
+    const x = hzToX(b.hz, W);
+    if (x < 0 || x > W) continue;
+    sctx.fillStyle = '#ffb547';
+    sctx.beginPath(); sctx.moveTo(x, 18 * dpr); sctx.lineTo(x - 4 * dpr, 12 * dpr); sctx.lineTo(x + 4 * dpr, 12 * dpr); sctx.fill();
+    bookmarkHits.push({ x: x / dpr, b });
+    if (x < lastEnd) continue;
+    const label = b.name.length > 16 ? b.name.slice(0, 15) + '…' : b.name;
+    const w = sctx.measureText(label).width;
+    const lx = Math.min(W - w - 2 * dpr, Math.max(2 * dpr, x - w / 2));
+    sctx.fillStyle = 'rgba(7,9,12,0.8)'; sctx.fillRect(lx - 2 * dpr, 0, w + 4 * dpr, 11 * dpr);
+    sctx.fillStyle = '#e8d2a8'; sctx.fillText(label, lx, 9 * dpr);
+    lastEnd = lx + w + 6 * dpr;
+  }
+}
+let bookmarkHits = [];
+
+// ── gestures on the display ─────────────────────────────────────────
+const display = $('display');
+const pointers = new Map();
+let gesture = null, tapTimer = null, lastTap = null;
+/** Frequency the tuning line is being dragged to (null when not dragging). */
+let dragHz = null, dragSent = 0, dragTimer = null, dragClear = null;
+const GRAB_PX = 24;
+
+function finishDrag() {
+  $('tuneline').classList.remove('drag');
+  sendDrag(true);
+  // If the server never confirms (e.g. an error), fall back to its frequency.
+  dragClear = setTimeout(() => { dragHz = null; if (S) showReadout(S.hz); dirty(true); }, 2000);
+}
+
+function sendDrag(final) {
+  clearTimeout(dragTimer);
+  const now = performance.now();
+  // At most ~12 retunes a second while dragging, and always the final position.
+  if (final || now - dragSent > 80) {
+    dragSent = now;
+    tune(dragHz);
+  } else {
+    dragTimer = setTimeout(() => sendDrag(true), 80);
+  }
+}
+
+display.addEventListener('pointerdown', (e) => {
+  if (!S) return;
+  display.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const rect = display.getBoundingClientRect();
+  if (pointers.size === 1) {
+    const lineX = hzToX(tunedHz(), rect.width), x = e.clientX - rect.left;
+    if (Math.abs(x - lineX) <= GRAB_PX) {
+      // Grabbed the tuning line: drag it to tune, keeping the finger's offset from the line.
+      clearTimeout(dragClear);
+      gesture = { type: 'tune', grab: x - lineX, rect };
+      dragHz = snap(tunedHz());
+      $('tuneline').classList.add('drag');
+      haptic();
+      return;
+    }
+    gesture = { type: 'tap', x0: e.clientX, y0: e.clientY, t0: performance.now(), center0: view.center, rect };
+  } else if (pointers.size === 2) {
+    if (gesture?.type === 'tune') finishDrag();
+    const [a, b] = [...pointers.values()];
+    const mid = (a.x + b.x) / 2 - rect.left;
+    gesture = { type: 'pinch', d0: Math.max(10, Math.abs(a.x - b.x)), span0: view.span, fmid: xToHz(mid, rect.width), rect };
+  }
+});
+display.addEventListener('pointermove', (e) => {
+  if (!pointers.has(e.pointerId) || !gesture) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const W = gesture.rect.width;
+  if (gesture.type === 'tap' && Math.abs(e.clientX - gesture.x0) > 8) gesture.type = 'pan';
+  if (gesture.type === 'tune') {
+    const x = e.clientX - gesture.rect.left;
+    // Near an edge, scroll the view so the line can be dragged further.
+    const edge = x < GRAB_PX ? -1 : x > W - GRAB_PX ? 1 : 0;
+    if (edge) { view.center += edge * view.span * 0.02; clampView(); }
+    const hz = snap(xToHz(Math.min(W, Math.max(0, x - gesture.grab)), W));
+    if (hz !== dragHz) {
+      dragHz = hz;
+      haptic();
+      showReadout(hz);
+      sendDrag(false);
+    }
+    dirty(true);
+  } else if (gesture.type === 'pan') {
+    view.center = gesture.center0 - ((e.clientX - gesture.x0) / W) * view.span;
+    clampView(); dirty(true);
+  } else if (gesture.type === 'pinch' && pointers.size >= 2) {
+    const [a, b] = [...pointers.values()];
+    const d = Math.max(10, Math.abs(a.x - b.x)), mid = (a.x + b.x) / 2 - gesture.rect.left;
+    view.span = gesture.span0 * gesture.d0 / d;
+    clampView();
+    // Keep the frequency between the fingers under them.
+    view.center = gesture.fmid - (mid / W - 0.5) * view.span;
+    clampView(); dirty(true);
+  }
+});
+function endPointer(e) {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.delete(e.pointerId);
+  if (!gesture) return;
+  if (gesture.type === 'tune') {
+    finishDrag();
+    gesture = null;
+    return;
+  }
+  if (gesture.type === 'tap' && e.type === 'pointerup' && performance.now() - gesture.t0 < 500) {
+    onTap(e.clientX - gesture.rect.left, e.clientY - gesture.rect.top, gesture.rect.width);
+  }
+  if (pointers.size === 0 || gesture.type === 'pinch') gesture = null;
+}
+display.addEventListener('pointerup', endPointer);
+display.addEventListener('pointercancel', endPointer);
+display.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = display.getBoundingClientRect(), x = e.clientX - rect.left, f = xToHz(x, rect.width);
+  view.span *= Math.exp(e.deltaY * 0.002);
+  clampView();
+  view.center = f - (x / rect.width - 0.5) * view.span;
+  clampView(); dirty(true);
+}, { passive: false });
+
+function onTap(x, y, W) {
+  const now = performance.now();
+  if (lastTap && now - lastTap.t < 300 && Math.abs(x - lastTap.x) < 30) {
+    // Double tap: zoom in around the tap, or back out to the whole band.
+    clearTimeout(tapTimer); lastTap = null;
+    const f = xToHz(x, W);
+    view.span = view.span < S.rate * 0.99 ? S.rate : view.span / 6;
+    clampView();
+    view.center = f - (x / W - 0.5) * view.span;
+    clampView(); dirty(true);
+    return;
+  }
+  lastTap = { t: now, x };
+  // A tap on a bookmark flag goes to the bookmark.
+  const flag = y < 26 ? bookmarkHits.find((h) => Math.abs(h.x - x) < 14) : null;
+  const hz = snap(xToHz(x, W));
+  clearTimeout(tapTimer);
+  tapTimer = setTimeout(() => { haptic(); flag ? goBookmark(flag.b) : tune(hz); }, 260);
+}
+
+// ── frequency readout: a text box to type in, drag sideways to step ─
+const readout = $('readout'), fin = $('fin');
+let drag = null;
+readout.addEventListener('pointerdown', (e) => {
+  if (!S || document.activeElement === fin) return;
+  drag = { id: e.pointerId, x0: e.clientX, base: snap(S.hz), steps: 0, moved: false };
+});
+readout.addEventListener('pointermove', (e) => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const dx = e.clientX - drag.x0;
+  if (Math.abs(dx) > 10 && !drag.moved) {
+    // A drag, not a tap: keep the pointer and don't open the keyboard.
+    drag.moved = true;
+    readout.setPointerCapture(e.pointerId);
+    readout.classList.add('drag');
+  }
+  if (!drag.moved) return;
+  e.preventDefault();
+  const steps = Math.trunc(dx / 22);
+  if (steps !== drag.steps) {
+    drag.steps = steps;
+    haptic();
+    const hz = drag.base + steps * S.step_hz;
+    showReadout(hz);
+    tune(hz);
+  }
+});
+function endDrag() {
+  if (drag?.moved) setTimeout(() => fin.blur(), 0);
+  drag = null;
+  readout.classList.remove('drag');
+}
+readout.addEventListener('pointerup', endDrag);
+readout.addEventListener('pointercancel', endDrag);
+
+/** Parse a typed frequency: "145.5" (MHz), "7074k", "446006.25 kHz", "145500000" (Hz),
+ *  "1.2G". Plain numbers are MHz below 2000, kHz below 2 000 000, and Hz above. */
+function parseFreq(text) {
+  const m = text.trim().replace(/[\s_']/g, '').replace(',', '.').match(/^(\d*\.?\d+)([kmg]?)(hz)?$/i);
+  if (!m) return null;
+  const v = parseFloat(m[1]), unit = m[2].toLowerCase();
+  if (!(v > 0)) return null;
+  if (unit === 'k') return v * 1e3;
+  if (unit === 'm') return v * 1e6;
+  if (unit === 'g') return v * 1e9;
+  return v < 2000 ? v * 1e6 : v < 2e6 ? v * 1e3 : v;
+}
+
+let editStart = '';
+fin.addEventListener('focus', () => {
+  if (!S) return;
+  readout.classList.add('editing');
+  // The current frequency in MHz without trailing zeros, selected so typing replaces it.
+  editStart = fin.value = String(+(S.hz / 1e6).toFixed(6));
+  requestAnimationFrame(() => fin.select());
+});
+function commitFreq() {
+  const text = fin.value;
+  if (text.trim() === '' || text === editStart) return true;
+  const hz = parseFreq(text);
+  if (hz === null) { toast('Type a frequency like 145.5, 7074k or 446006.25k'); return false; }
+  haptic();
+  dragHz = null;
+  showReadout(hz);
+  tune(hz);
+  return true;
+}
+fin.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); if (commitFreq()) { editStart = fin.value; fin.blur(); } }
+  else if (e.key === 'Escape') { fin.value = editStart; fin.blur(); }
+});
+// Tapping away (or iOS "Done") also tunes, since the iOS number pad has no Enter key.
+fin.addEventListener('blur', () => {
+  commitFreq();
+  readout.classList.remove('editing');
+  fin.value = '';
+});
+
+// ── sheets ──────────────────────────────────────────────────────────
+function openSheet(id) {
+  closeSheets();
+  $('scrim').hidden = false; $(id).hidden = false;
+}
+function closeSheets() {
+  $('scrim').hidden = true;
+  for (const s of document.querySelectorAll('.sheet')) s.hidden = true;
+}
+$('scrim').onclick = closeSheets;
+$('bmbtn').onclick = () => { renderBookmarks(); $('bmnew').value = currentBookmark()?.name || ''; openSheet('sheet-bm'); };
+$('setbtn').onclick = () => openSheet('sheet-set');
+
+function renderBookmarks() {
+  const cur = currentBookmark();
+  $('bmname').textContent = cur ? '★ ' + cur.name : '';
+  const list = $('bmlist');
+  if ($('sheet-bm').hidden) return;
+  list.innerHTML = '';
+  for (const b of [...bookmarks].sort((a, c) => a.hz - c.hz)) {
+    const li = document.createElement('li');
+    const go = document.createElement('button');
+    go.className = 'go' + (b === cur ? ' cur' : '');
+    go.innerHTML = '<span></span><small></small>';
+    go.firstChild.textContent = b.name;
+    go.lastChild.textContent = fmtMHz(b.hz, b.hz % 1000 ? 5 : 3) + ' MHz';
+    go.onclick = () => { goBookmark(b); closeSheets(); };
+    const m = document.createElement('span');
+    m.className = 'm'; m.textContent = b.mode.toUpperCase();
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '✕'; del.setAttribute('aria-label', 'Delete ' + b.name);
+    del.onclick = () => {
+      if (del.classList.contains('confirm')) { send({ cmd: 'bookmark_del', id: b.id }); return; }
+      del.classList.add('confirm'); del.textContent = 'Delete';
+      setTimeout(() => { del.classList.remove('confirm'); del.textContent = '✕'; }, 2500);
+    };
+    li.append(go, m, del);
+    list.appendChild(li);
+  }
+}
+$('bmadd').onclick = () => {
+  const name = $('bmnew').value.trim() || fmtMHz(S.hz, 4) + ' ' + S.mode.toUpperCase();
+  const def = S.modes.find((m) => m.name === S.mode);
+  const b = { cmd: 'bookmark_add', name, hz: S.hz, mode: S.mode };
+  if (def && def.bandwidth !== S.bandwidth) b.bandwidth = S.bandwidth;
+  if (def && def.squelch !== S.squelch && S.squelch != null) b.squelch = S.squelch;
+  send(b);
+  $('bmnew').value = '';
+  $('bmnew').blur();
+};
+
+
+// ── controls ────────────────────────────────────────────────────────
+$('down').onclick = () => stepBy(-1);
+$('up').onclick = () => stepBy(1);
+$('sql').addEventListener('input', (e) => {
+  const v = +e.target.value;
+  setSquelchUi(v < 0 ? null : v);
+});
+$('sql').addEventListener('change', (e) => {
+  const v = +e.target.value;
+  send({ cmd: 'squelch', db: v < 0 ? null : v });
+});
+$('cleanup').onclick = () => { haptic(); send({ cmd: 'cleanup', on: !S?.cleanup }); };
+$('gainauto').onclick = () => {
+  if (!S) return;
+  send({ cmd: 'gain', db: S.gain === null ? S.gains[+$('gain').value] ?? 30 : 'auto' });
+};
+$('gain').addEventListener('input', (e) => { if (S) $('gainlbl').textContent = S.gains[+e.target.value].toFixed(1) + ' dB'; });
+$('gain').addEventListener('change', (e) => { if (S) send({ cmd: 'gain', db: S.gains[+e.target.value] }); });
+$('bw').addEventListener('input', (e) => { $('bwlbl').textContent = fmtHz(sliderToBw(+e.target.value)) + 'Hz'; });
+$('bw').addEventListener('change', (e) => send({ cmd: 'bandwidth', hz: sliderToBw(+e.target.value) }));
+$('volume').value = prefs.volume;
+$('vollbl').textContent = Math.round(prefs.volume * 100) + ' %';
+$('volume').addEventListener('input', (e) => {
+  prefs.volume = +e.target.value; savePrefs();
+  $('vollbl').textContent = Math.round(prefs.volume * 100) + ' %';
+  if (gain) gain.gain.value = prefs.volume;
+});
+setToggle('lowdata', prefs.lowdata);
+$('lowdata').onclick = () => {
+  prefs.lowdata = !prefs.lowdata; savePrefs(); setToggle('lowdata', prefs.lowdata);
+  send({ cmd: 'lowdata', on: prefs.lowdata });
+};
+setToggle('bg', prefs.bg);
+$('bg').onclick = () => {
+  prefs.bg = !prefs.bg; savePrefs(); setToggle('bg', prefs.bg);
+  if (playing) route();
+};
+
+// ── audio ───────────────────────────────────────────────────────────
+let ctx = null, gain = null, streamDest = null, next = 0, playing = false, wakeLock = null;
+const bgAudio = $('bgAudio');
+
+// iOS mutes Web Audio with the silent switch unless the page also plays an HTML media
+// element. A looping silent clip, started from the Play tap, keeps it in "playback" mode
+// (see serve.html).
+const keepAlive = new Audio(silentWavUrl(0.5));
+keepAlive.loop = true;
+keepAlive.setAttribute('playsinline', '');
+
+function silentWavUrl(seconds) {
+  const rate = 8000, n = Math.round(rate * seconds), buf = new ArrayBuffer(44 + 2 * n), v = new DataView(buf);
+  const text = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  text(0, 'RIFF'); v.setUint32(4, 36 + 2 * n, true); text(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, 2 * rate, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); text(36, 'data'); v.setUint32(40, 2 * n, true);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+/** Route the audio straight to the speaker, or (for playing while locked) through an
+ *  <audio> element, which the browser keeps alive in the background. */
+function route() {
+  if (!ctx) return;
+  gain.disconnect();
+  if (prefs.bg && ctx.createMediaStreamDestination) {
+    streamDest = streamDest || ctx.createMediaStreamDestination();
+    gain.connect(streamDest);
+    if (bgAudio.srcObject !== streamDest.stream) bgAudio.srcObject = streamDest.stream;
+    bgAudio.play().catch(() => {});
+    keepAlive.pause();
+  } else {
+    gain.connect(ctx.destination);
+    bgAudio.pause();
+    keepAlive.play().catch(() => {});
+  }
+}
+
+function onAudio(b) {
+  if (!ctx || !playing) return;
+  if (ctx.state !== 'running') ctx.resume().catch(() => {});
+  const n = (b.length - 4) * 2;
+  const ab = ctx.createBuffer(1, n, RATE);
+  adpcm(b, 1, n, ab.getChannelData(0), 1 / 32768);
+  const now = ctx.currentTime;
+  if (next < now + 0.02) next = now + LEAD;     // after a gap, rebuild a small buffer
+  if (next > now + MAX_LAG) return;             // running ahead: drop to keep latency down
+  const src = ctx.createBufferSource();
+  src.buffer = ab;
+  src.connect(gain);
+  src.start(next);
+  next += ab.duration;
+}
+
+async function start() {
+  // Must happen synchronously inside the tap, before any await.
+  if (prefs.bg) bgAudio.play().catch(() => {}); else keepAlive.play().catch(() => {});
+  if (!ctx) {
+    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    gain = ctx.createGain();
+    gain.gain.value = prefs.volume;
+  }
+  route();
+  const resumed = ctx.resume();
+  playing = true;
+  next = 0;
+  $('play').textContent = '■ Stop'; $('play').className = 'btn play stop';
+  setMediaState();
+  await resumed.catch(() => {});
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
+}
+
+async function stop() {
+  playing = false;
+  keepAlive.pause(); bgAudio.pause();
+  if (ctx) await ctx.suspend();
+  try { await wakeLock?.release(); } catch (_) {}
+  wakeLock = null;
+  $('play').textContent = '▶ Play'; $('play').className = 'btn play';
+  setMediaState();
+}
+$('play').onclick = () => (playing ? stop() : start());
+
+// ── lock screen (Media Session) ─────────────────────────────────────
+function updateTitle() {
+  if (!S) return;
+  const b = currentBookmark();
+  const title = (b ? b.name : fmtMHz(S.hz, 4) + ' MHz');
+  document.title = title + ' · sdrfun';
+  if ('mediaSession' in navigator && window.MediaMetadata) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title, artist: S.mode.toUpperCase() + (b ? ' · ' + fmtMHz(S.hz, 4) + ' MHz' : ''), album: 'sdrfun',
+    });
+  }
+}
+function setMediaState() {
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
+}
+if ('mediaSession' in navigator) {
+  const on = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch (_) {} };
+  on('play', () => start());
+  on('pause', () => stop());
+  on('stop', () => stop());
+  on('nexttrack', () => nextBookmark(1));
+  on('previoustrack', () => nextBookmark(-1));
+}
+
+// ── misc ────────────────────────────────────────────────────────────
+let toastTimer = null;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg; t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
+}
+
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && playing) {
+    if (ctx) await ctx.resume().catch(() => {});
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
+  }
+});
+window.addEventListener('resize', resize);
+resize();
+connect();
+</script>
+</body>
+</html>

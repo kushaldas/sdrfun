@@ -202,6 +202,28 @@ impl CleanChain {
     }
 }
 
+/// The chain used when voice cleanup is off: band-pass, then AGC + limiter. Works for any
+/// audio (music, tones), unlike the voice denoiser.
+pub struct BasicChain {
+    bandpass: Cascade,
+    agc: agc::Agc,
+}
+
+impl BasicChain {
+    /// `highpass`/`lowpass` are corner frequencies in Hz.
+    pub fn new(highpass: f32, lowpass: f32, agc_target: f32, agc_max_gain: f32) -> Self {
+        Self {
+            bandpass: Cascade::bandpass(SAMPLE_RATE as f32, Some(highpass), Some(lowpass)),
+            agc: agc::Agc::new(agc_target, agc_max_gain),
+        }
+    }
+
+    pub fn process_frame(&mut self, frame: &mut [f32; FRAME]) {
+        self.bandpass.process_in_place(frame);
+        self.agc.process_frame(frame);
+    }
+}
+
 /// Run a whole buffer through a fresh chain, compensating latency so the
 /// output lines up with (and has the same length as) the input.
 pub fn clean_all(input: &[f32], cfg: &CleanConfig) -> (Vec<f32>, ChainStats) {

@@ -18,7 +18,7 @@ use crate::channel::{Channel, Mode};
 use crate::clean::{CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{GateConfig, GateEvent, Verdict};
 use crate::listen::{Receiver, Session};
-use crate::sdr::{Block, Device, Gain};
+use crate::sdr::{Block, Control, Device, Gain};
 
 /// Default survey: Stockholm Arlanda (ESSA) frequencies from public listings
 /// (OurAirports, SkyVector, RadioReference, Flight Plan Database), 2026-10.
@@ -38,9 +38,9 @@ const ARLANDA: &[(f64, &str)] = &[
 ];
 
 /// Part of the captured bandwidth used for channels (the RTL's edges roll off).
-const USABLE_FRACTION: f64 = 0.75;
+pub(crate) const USABLE_FRACTION: f64 = 0.75;
 /// Keep channels at least this far from the tuner centre (DC spike).
-const DC_GUARD_HZ: f64 = 20_000.0;
+pub(crate) const DC_GUARD_HZ: f64 = 20_000.0;
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
@@ -65,10 +65,10 @@ pub struct ScanArgs {
     /// IQ sample rate, a multiple of 48000
     #[arg(long, default_value_t = 2_400_000)]
     pub sample_rate: u32,
-    /// Demodulation: am (airband) or fm (amateur, PMR)
+    /// Demodulation: am (airband), nfm/fm (amateur, PMR), wfm (broadcast), usb, lsb or cw
     #[arg(long, value_enum, default_value_t = Mode::Am)]
     pub mode: Mode,
-    /// Channel filter width, Hz [default: 10000 for AM, 12500 for FM]
+    /// Channel filter width, Hz [default: 10000 AM, 12500 NFM, 180000 WFM, 2400 USB/LSB, 500 CW]
     #[arg(long)]
     pub bandwidth: Option<f32>,
     /// Directory for recordings
@@ -205,7 +205,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
             .context("installing Ctrl-C handler")?;
     }
     let (tx, rx) = sync_channel::<Block>(64);
-    let (retune_tx, retune_rx) = channel::<u32>();
+    let (retune_tx, retune_rx) = channel::<Control>();
     let reader = {
         let stop = stop.clone();
         thread::spawn(move || dev.stream(tx, stop, Some(retune_rx)))
@@ -220,7 +220,7 @@ pub fn run(args: ScanArgs) -> Result<()> {
         round += 1;
         for (n, group) in groups.iter().enumerate() {
             if group.center_hz != tuned {
-                retune_tx.send(group.center_hz).map_err(|_| anyhow!("SDR reader stopped"))?;
+                retune_tx.send(Control::Center(group.center_hz)).map_err(|_| anyhow!("SDR reader stopped"))?;
                 tuned = group.center_hz;
             }
             let mut receivers = group
