@@ -6,8 +6,10 @@
 //! WebSocket messages, server → client (see also `serve.rs`):
 //! - text JSON: `state` (full receiver state after every change), `bookmarks`, `meter`
 //!   (level, floor, squelch open, ADC clipping; 10 a second) and `error`.
-//! - binary, first byte = type: `1` audio (IMA ADPCM chunk of `STREAM_RATE` mono, see
-//!   `adpcm.rs`); `2` wideband and `3` detail waterfall row: `ROW_HEADER` bytes (centre Hz
+//! - binary, first byte = type: `4` audio, full quality (rate u32 LE, then mono s16le PCM;
+//!   48 kHz for WFM, `STREAM_RATE` otherwise); `1` the same audio for low-data clients
+//!   (IMA ADPCM chunk of `STREAM_RATE` mono, see `adpcm.rs`); each client gets one of the
+//!   two. `2` wideband and `3` detail waterfall row: `ROW_HEADER` bytes (centre Hz
 //!   u32, span Hz u32, lo dB f32, hi dB f32, bins u16, all LE) then an ADPCM chunk of
 //!   `bins` levels (0..255 scaled by `ROW_SCALE`).
 //!
@@ -16,6 +18,7 @@
 //! `span` {rate}, `bookmark_add` {name, hz, mode, bandwidth?, squelch?}, `bookmark_del`
 //! {id}, and `lowdata` {on} (handled per client in `serve.rs`).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,11 +35,12 @@ use crate::adpcm;
 use crate::audio_out::AudioOut;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::channel::{Channel, Frame, Mode, WFM_DEEMPHASIS_US};
-use crate::clean::{BasicChain, CleanChain, CleanConfig, SAMPLE_RATE};
+use crate::clean::{BasicChain, CleanChain, CleanConfig, FRAME, SAMPLE_RATE};
 use crate::dsp::resample::Resampler;
+use crate::gate::DEFAULT_PRE_ROLL_S;
 use crate::scan::{DC_GUARD_HZ, USABLE_FRACTION};
 use crate::sdr::{Block, Control, Device, Gain};
-use crate::serve::{CHUNK, Hub, STREAM_RATE, to_i16};
+use crate::serve::{AUDIO_FULL, AUDIO_LOW, CHUNK, Hub, STREAM_RATE, to_i16};
 use crate::spectrum::{Levels, Spectrum};
 use crate::squelch::Squelch;
 
@@ -49,9 +53,9 @@ const ROWS_PER_S: u32 = 10;
 /// Frames between meter messages (100 ms).
 const METER_FRAMES: usize = 10;
 pub const ROW_HEADER: usize = 19;
-/// Carrier prominence (see `channel::Frame`) that counts as a carrier, as `--carrier-prominence`
-/// for the gate: noise measures below 4 dB.
-const CARRIER_PROMINENCE_DB: f32 = 6.0;
+/// While the squelch is on, audio is held back this long so a transmission is heard from
+/// just before the squelch opened, like `listen`'s pre-roll (0.3 s).
+const PRE_ROLL_FRAMES: usize = (DEFAULT_PRE_ROLL_S * 100.0) as usize;
 /// After a gain or rate change, learn the noise floor from scratch for this many frames
 /// (200 ms), until the tuner and filters have settled.
 const RELEARN_FRAMES: u32 = 20;
@@ -169,6 +173,8 @@ pub struct Radio {
     relearn: u32,
     /// ADC samples at the rails, and all samples, since the last meter message.
     clipped: (u64, u64),
+    /// Audio held back for the pre-roll, with whether the squelch was open for it.
+    pre_roll: VecDeque<([f32; FRAME], bool)>,
 }
 
 impl Radio {
@@ -187,7 +193,6 @@ impl Radio {
         let bandwidth = mode.default_bandwidth();
         let center_hz = plan_center(tuned_hz, tuned_hz, rate, bandwidth).unwrap_or(tuned_hz);
         let channel = build_channel(rate, center_hz, tuned_hz, mode, bandwidth, deemphasis)?;
-        let (hp, lp) = mode.audio_band();
         Ok(Self {
             rate,
             center_hz,
@@ -201,7 +206,7 @@ impl Radio {
             clean: CleanChain::new(&clean_cfg),
             channel,
             channel_at: (center_hz as u32, rate),
-            basic: BasicChain::new(hp, lp, AGC_TARGET_DBFS, AGC_MAX_GAIN_DB),
+            basic: basic_chain(mode),
             squelch: Squelch::new(mode.default_squelch()),
             wide: Spectrum::new(WIDE_BINS, rate, ROWS_PER_S),
             wide_levels: Levels::default(),
@@ -216,7 +221,14 @@ impl Radio {
             settings: 0,
             relearn: 0,
             clipped: (0, 0),
+            pre_roll: VecDeque::new(),
         })
+    }
+
+    /// Sample rate of the full-quality audio stream: broadcast FM keeps its 15 kHz audio,
+    /// voice needs less.
+    pub fn audio_rate(&self) -> u32 {
+        if self.mode == Mode::Wfm { SAMPLE_RATE } else { STREAM_RATE }
     }
 
     pub fn center_hz(&self) -> u32 {
@@ -301,8 +313,7 @@ impl Radio {
         self.bandwidth = mode.default_bandwidth();
         self.cleanup = mode.default_cleanup();
         self.squelch.threshold = mode.default_squelch();
-        let (hp, lp) = mode.audio_band();
-        self.basic = BasicChain::new(hp, lp, AGC_TARGET_DBFS, AGC_MAX_GAIN_DB);
+        self.basic = basic_chain(mode);
         self.detail = Spectrum::new(DETAIL_BINS, mode.demod_rate(), ROWS_PER_S);
         self.detail_levels = Levels::default();
         self.rebuild(old_bw)
@@ -404,18 +415,31 @@ impl Radio {
                 self.relearn -= 1;
                 self.squelch.relearn();
             }
-            let carrier = matches!(self.mode, Mode::Am | Mode::Nfm) && frame.carrier_db >= CARRIER_PROMINENCE_DB;
-            let open = self.squelch.push(frame.power_db, carrier);
+            // Only AM and NFM have a carrier for the prominence measure to find.
+            let carrier_db = if matches!(self.mode, Mode::Am | Mode::Nfm) { frame.carrier_db } else { 0.0 };
+            let open = self.squelch.push(frame.power_db, carrier_db);
             let mut audio = frame.audio;
             if self.cleanup {
                 self.clean.process_frame(&mut audio);
             } else {
                 self.basic.process_frame(&mut audio);
             }
-            if !open {
-                audio = [0.0; crate::clean::FRAME];
+            if self.squelch.threshold.is_none() {
+                // Squelch off: nothing to look ahead for; release anything held back.
+                for (held, _) in self.pre_roll.drain(..) {
+                    out.audio.extend_from_slice(&held);
+                }
+                out.audio.extend_from_slice(&audio);
+            } else {
+                self.pre_roll.push_back((audio, open));
+                if self.pre_roll.len() > PRE_ROLL_FRAMES
+                    && let Some((held, was_open)) = self.pre_roll.pop_front()
+                {
+                    // A frame plays if the squelch was open for it or opens within the pre-roll.
+                    let pass = was_open || self.pre_roll.iter().any(|&(_, o)| o);
+                    out.audio.extend_from_slice(if pass { &held } else { &[0.0; FRAME] });
+                }
             }
-            out.audio.extend_from_slice(&audio);
             self.meter_frames += 1;
             if self.meter_frames >= METER_FRAMES {
                 self.meter_frames = 0;
@@ -466,6 +490,16 @@ fn build_channel(rate: u32, center: f64, hz: f64, mode: Mode, bandwidth: f32, de
     Ok(channel)
 }
 
+/// Audio processing when voice cleanup is off. Broadcast FM gets none, like SDR++: its level is
+/// already steady, and an AGC riding music in 10 ms steps only colours it.
+fn basic_chain(mode: Mode) -> BasicChain {
+    if mode == Mode::Wfm {
+        return BasicChain::passthrough();
+    }
+    let (hp, lp) = mode.audio_band();
+    BasicChain::new(hp, lp, AGC_TARGET_DBFS, AGC_MAX_GAIN_DB)
+}
+
 fn parse_mode(name: &str) -> Result<Mode> {
     Mode::from_name(name).ok_or_else(|| anyhow!("unknown mode {name:?}"))
 }
@@ -493,34 +527,68 @@ fn row_message(kind: u8, center_hz: u32, span: u32, range: &Levels, levels: &[u8
     msg
 }
 
-/// 48 kHz audio → `STREAM_RATE` ADPCM messages of `CHUNK` samples.
+/// 48 kHz audio → messages for the page, in 100 ms pieces: full-quality 16-bit PCM at the
+/// mode's rate (`AUDIO_FULL`: rate u32 LE, then s16le) and IMA ADPCM at `STREAM_RATE` for
+/// low-data clients (`AUDIO_LOW`). Each client gets one of the two (see `serve.rs`).
 struct AudioStream {
-    resampler: Resampler,
-    scratch: Vec<f32>,
-    pending: Vec<i16>,
+    low: Resampler,
+    low_scratch: Vec<f32>,
+    low_pending: Vec<i16>,
     enc: adpcm::Encoder,
+    full_rate: u32,
+    full: Resampler,
+    full_scratch: Vec<f32>,
+    full_pending: Vec<i16>,
 }
 
 impl AudioStream {
-    fn new() -> Self {
+    fn new(full_rate: u32) -> Self {
         Self {
-            resampler: Resampler::new(SAMPLE_RATE, STREAM_RATE),
-            scratch: Vec::new(),
-            pending: Vec::with_capacity(CHUNK),
+            low: Resampler::new(SAMPLE_RATE, STREAM_RATE),
+            low_scratch: Vec::new(),
+            low_pending: Vec::with_capacity(CHUNK),
             enc: adpcm::Encoder::default(),
+            full_rate,
+            full: Resampler::new(SAMPLE_RATE, full_rate),
+            full_scratch: Vec::new(),
+            full_pending: Vec::new(),
+        }
+    }
+
+    /// Switch the full-quality rate (when the mode changes).
+    fn set_full_rate(&mut self, rate: u32) {
+        if rate != self.full_rate {
+            self.full_rate = rate;
+            self.full = Resampler::new(SAMPLE_RATE, rate);
+            self.full_pending.clear();
         }
     }
 
     fn push(&mut self, audio: &[f32], out: &mut Vec<Vec<u8>>) {
-        self.scratch.clear();
-        self.resampler.process(audio, &mut self.scratch);
-        for &s in &self.scratch {
-            self.pending.push(to_i16(s));
-            if self.pending.len() == CHUNK {
-                let mut msg = vec![1u8];
-                msg.extend(self.enc.encode(&self.pending));
+        self.low_scratch.clear();
+        self.low.process(audio, &mut self.low_scratch);
+        for &s in &self.low_scratch {
+            self.low_pending.push(to_i16(s));
+            if self.low_pending.len() == CHUNK {
+                let mut msg = vec![AUDIO_LOW];
+                msg.extend(self.enc.encode(&self.low_pending));
                 out.push(msg);
-                self.pending.clear();
+                self.low_pending.clear();
+            }
+        }
+
+        let chunk = self.full_rate as usize / 10;
+        self.full_scratch.clear();
+        self.full.process(audio, &mut self.full_scratch);
+        for &s in &self.full_scratch {
+            self.full_pending.push(to_i16(s));
+            if self.full_pending.len() == chunk {
+                let mut msg = Vec::with_capacity(5 + 2 * chunk);
+                msg.push(AUDIO_FULL);
+                msg.extend_from_slice(&self.full_rate.to_le_bytes());
+                msg.extend(self.full_pending.iter().flat_map(|v| v.to_le_bytes()));
+                out.push(msg);
+                self.full_pending.clear();
             }
         }
     }
@@ -597,7 +665,7 @@ fn serve(
     mut speaker: Option<&mut AudioOut>,
     stop: &AtomicBool,
 ) {
-    let mut stream = AudioStream::new();
+    let mut stream = AudioStream::new(radio.audio_rate());
     let mut audio_msgs = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         for cmd in cmd_rx.try_iter() {
@@ -639,6 +707,7 @@ fn serve(
             s.play(&out.audio);
         }
         if hub.clients() > 0 {
+            stream.set_full_rate(radio.audio_rate());
             stream.push(&out.audio, &mut audio_msgs);
             for msg in audio_msgs.drain(..).chain(out.rows) {
                 hub.binary(msg);
@@ -685,6 +754,40 @@ mod tests {
     }
 
     #[test]
+    fn squelch_hears_from_the_pre_roll_like_listen() {
+        let mut r = radio(960_000, 145.5, Mode::Nfm);
+        assert_eq!(r.state_json()["squelch"], crate::gate::DEFAULT_SQUELCH_MARGIN);
+        // RNNoise would squash the test tone.
+        r.command(&json!({"cmd": "cleanup", "on": false})).unwrap();
+        let mut out = Output::default();
+        // 1 s of noise (it becomes the floor), then a strong signal.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let noise: Vec<u8> = (0..2 * 960_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (125 + (state & 7) as u8).min(130)
+            })
+            .collect();
+        r.process(&Block { center_hz: r.center_hz(), rate: 960_000, settings: 0, data: noise }, &mut out);
+        r.process(&block(&r, 145.5e6, 1.0, 0.3), &mut out);
+        let frames: Vec<f32> = out
+            .audio
+            .chunks(FRAME)
+            .map(|f| (f.iter().map(|x| x * x).sum::<f32>() / FRAME as f32).sqrt())
+            .collect();
+        // The last pre-roll's worth is still held back.
+        assert_eq!(frames.len(), 200 - PRE_ROLL_FRAMES);
+        // The strong signal starts at frame 100. The 0.3 s before it is heard too (here:
+        // the noise), and nothing earlier.
+        let onset = 100;
+        assert!(frames[..onset - PRE_ROLL_FRAMES - 1].iter().all(|&r| r == 0.0));
+        assert!(frames[onset - PRE_ROLL_FRAMES + 1..onset].iter().all(|&r| r > 0.0), "pre-roll muted");
+        assert!(frames[onset + 5..].iter().all(|&r| r > 0.01));
+    }
+
+    #[test]
     fn plan_center_keeps_channel_in_band_and_off_dc() {
         let rate = 2_400_000;
         // Already fine: no hop.
@@ -724,6 +827,7 @@ mod tests {
     #[test]
     fn tuning_within_band_retunes_without_hop_and_far_tune_hops() {
         let mut r = radio(960_000, 145.5, Mode::Nfm);
+        r.command(&json!({"cmd": "squelch", "db": null})).unwrap();
         let center = r.center_hz();
         assert!(r.command(&json!({"cmd": "tune", "hz": 145.45e6})).unwrap().is_empty());
         assert_eq!(r.center_hz(), center);
@@ -746,7 +850,7 @@ mod tests {
         r.command(&json!({"cmd": "mode", "mode": "wfm"})).unwrap();
         let s = r.state_json();
         assert_eq!(s["mode"], "wfm");
-        assert_eq!(s["bandwidth"], 180_000.0);
+        assert_eq!(s["bandwidth"], 150_000.0);
         assert_eq!(s["cleanup"], false);
         assert!(s["squelch"].is_null());
         // A WFM channel this close to DC forces a hop.
@@ -765,6 +869,7 @@ mod tests {
     #[test]
     fn gain_snaps_and_span_changes_rate() {
         let mut r = radio(2_400_000, 145.5, Mode::Nfm);
+        r.command(&json!({"cmd": "squelch", "db": null})).unwrap();
         let c = r.command(&json!({"cmd": "gain", "db": 33.0})).unwrap();
         assert!(matches!(c[..], [Control::Gain(Gain::Manual(g))] if g == 32.8));
         let c = r.command(&json!({"cmd": "gain", "db": "auto"})).unwrap();
@@ -779,6 +884,57 @@ mod tests {
         let mut out = Output::default();
         r.process(&b, &mut out);
         assert_eq!(out.audio.len(), SAMPLE_RATE as usize / 10);
+    }
+
+    /// Runs a recorded u8 IQ file (e.g. from `rtl_sdr`) through the web receiver and dumps
+    /// raw f32 audio: the demodulator (48 kHz), after the audio chain (48 kHz), and what the
+    /// page receives: `full.f32` (PCM at `Radio::audio_rate`) and `sent.f32` (24 kHz ADPCM,
+    /// low data). For checking audio quality
+    /// offline:
+    /// `SDRFUN_IQ=x.cu8 SDRFUN_IQ_CENTER=105.5e6 SDRFUN_TUNE=105.9e6 SDRFUN_MODE=wfm SDRFUN_OUT=dir
+    ///  cargo test --release web::tests::dump_iq_file -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_iq_file() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let iq = std::fs::read(var("SDRFUN_IQ")).unwrap();
+        let center: f64 = var("SDRFUN_IQ_CENTER").parse().unwrap();
+        let tune: f64 = var("SDRFUN_TUNE").parse().unwrap();
+        let mode = Mode::from_name(&var("SDRFUN_MODE")).unwrap();
+        let out_dir = PathBuf::from(var("SDRFUN_OUT"));
+        let rate = 2_400_000;
+
+        let bandwidth = std::env::var("SDRFUN_BW").map_or(mode.default_bandwidth(), |b| b.parse().unwrap());
+        let mut channel = build_channel(rate, center, tune, mode, bandwidth, 50.0).unwrap();
+        let mut frames = Vec::new();
+        let mut r = radio(rate, tune / 1e6, mode);
+        r.command(&json!({"cmd": "squelch", "db": null})).unwrap();
+        r.command(&json!({"cmd": "cleanup", "on": false})).unwrap();
+        r.center_hz = center;
+        let mut stream = AudioStream::new(r.audio_rate());
+        let (mut demod, mut chain, mut sent, mut full) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for data in iq.chunks(16 * 16384) {
+            channel.process_u8(data, &mut frames);
+            demod.extend(frames.drain(..).flat_map(|f| f.audio));
+            let mut out = Output::default();
+            r.process(&Block { center_hz: center as u32, rate, settings: 0, data: data.to_vec() }, &mut out);
+            chain.extend_from_slice(&out.audio);
+            let mut msgs = Vec::new();
+            stream.push(&out.audio, &mut msgs);
+            for m in msgs {
+                match m[0] {
+                    AUDIO_LOW => sent.extend(adpcm::decode(&m[1..], CHUNK).iter().map(|&s| s as f32 / 32768.0)),
+                    _ => full.extend(m[5..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)),
+                }
+            }
+        }
+        let write = |name: &str, x: &[f32]| {
+            std::fs::write(out_dir.join(name), x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap()
+        };
+        write("demod.f32", &demod);
+        write("chain.f32", &chain);
+        write("sent.f32", &sent);
+        write("full.f32", &full);
     }
 
     /// Serves the page on 127.0.0.1:8011 with simulated IQ (noise plus a few FM and AM

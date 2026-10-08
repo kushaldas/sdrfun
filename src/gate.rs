@@ -13,27 +13,34 @@ use crate::clean::{FRAME, FrameInfo, SAMPLE_RATE};
 
 const FRAMES_PER_S: f32 = SAMPLE_RATE as f32 / FRAME as f32;
 /// The carrier must fall this far below the open threshold before hang time starts.
-const HYSTERESIS_DB: f32 = 3.0;
+pub(crate) const HYSTERESIS_DB: f32 = 3.0;
 /// Audio kept after the carrier drops (the rest of the hang time is trimmed).
 const TAIL_S: f32 = 0.3;
 /// Noise floor tracking per frame: falls quickly (~0.2 s), rises slowly (~10 s) while idle
 /// and very slowly (~5 min) during a transmission, so a stuck carrier is eventually absorbed.
-const FLOOR_FALL: f32 = 0.05;
-const FLOOR_RISE_IDLE: f32 = 0.001;
-const FLOOR_RISE_OPEN: f32 = 1.0 / 30_000.0;
+pub(crate) const FLOOR_FALL: f32 = 0.05;
+pub(crate) const FLOOR_RISE_IDLE: f32 = 0.001;
+pub(crate) const FLOOR_RISE_OPEN: f32 = 1.0 / 30_000.0;
 /// Frames ignored after start-up while the channel filters and carrier detector settle.
-const WARMUP_FRAMES: u64 = 5;
+pub(crate) const WARMUP_FRAMES: u64 = 5;
+
+/// Defaults of `GateConfig`, also used by the web receiver's squelch so that it opens and
+/// closes like `listen`.
+pub const DEFAULT_SQUELCH_MARGIN: f32 = 8.0;
+pub const DEFAULT_HANG_S: f32 = 1.5;
+pub const DEFAULT_PRE_ROLL_S: f32 = 0.3;
+pub const DEFAULT_CARRIER_PROMINENCE: f32 = 6.0;
 
 #[derive(Args, Clone, Debug)]
 pub struct GateConfig {
     /// Open the gate when channel power is this many dB above the noise floor
-    #[arg(long, default_value_t = 8.0)]
+    #[arg(long, default_value_t = DEFAULT_SQUELCH_MARGIN)]
     pub squelch_margin: f32,
     /// Seconds the gate stays open after the carrier drops
-    #[arg(long, default_value_t = 1.5)]
+    #[arg(long, default_value_t = DEFAULT_HANG_S)]
     pub hang: f32,
     /// Seconds of audio kept from before the gate opened
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = DEFAULT_PRE_ROLL_S)]
     pub pre_roll: f32,
     /// Drop transmissions whose carrier lasted less than this many seconds
     #[arg(long, default_value_t = 0.5)]
@@ -50,7 +57,7 @@ pub struct GateConfig {
     pub min_spectral_change: f32,
     /// Carrier prominence (dB, channel centre over edges) above which a frame is treated
     /// as carrying a signal: such frames never train the noise floor
-    #[arg(long, default_value_t = 6.0)]
+    #[arg(long, default_value_t = DEFAULT_CARRIER_PROMINENCE)]
     pub carrier_prominence: f32,
     /// Split transmissions longer than this many seconds (bounds memory on continuous carriers)
     #[arg(long, default_value_t = 60.0)]
