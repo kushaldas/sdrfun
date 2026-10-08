@@ -243,7 +243,7 @@
     <div class="lbl"><span>Volume</span><b id="vollbl">100 %</b></div>
     <input type="range" id="volume" min="0" max="3" step="0.05" value="1">
   </div>
-  <div class="field"><button class="btn toggle" id="lowdata"><span class="sw"></span><span>Low data (fewer waterfall lines)</span></button></div>
+  <div class="field"><button class="btn toggle" id="lowdata"><span class="sw"></span><span>Low data (compressed audio, fewer waterfall lines)</span></button></div>
   <div class="field"><button class="btn toggle" id="bg"><span class="sw"></span><span>Keep playing when locked</span></button></div>
   <p class="note">Everyone connected shares this receiver: tuning here retunes it for all of them.
     Pinch the waterfall to zoom, drag to pan, tap to tune, double-tap to zoom in or out.
@@ -257,7 +257,7 @@
 
 <script>
 'use strict';
-const RATE = 24000;            // STREAM_RATE in serve.rs
+const RATE = 24000;            // STREAM_RATE in serve.rs (low-data audio)
 const LEAD = 0.25;             // seconds buffered when audio (re)starts
 const MAX_LAG = 1.0;           // drop audio once this far ahead (SDR clock faster than the phone's)
 const ROW_HEADER = 19;         // web.rs
@@ -342,7 +342,7 @@ function onEvent(ev) {
 }
 
 function onBinary(b) {
-  if (b[0] === 1) return onAudio(b);
+  if (b[0] === 1 || b[0] === 4) return onAudio(b);
   if (b[0] !== 2 && b[0] !== 3) return;
   const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   const bins = dv.getUint16(17, true);
@@ -989,9 +989,20 @@ function route() {
 function onAudio(b) {
   if (!ctx || !playing) return;
   if (ctx.state !== 'running') ctx.resume().catch(() => {});
-  const n = (b.length - 4) * 2;
-  const ab = ctx.createBuffer(1, n, RATE);
-  adpcm(b, 1, n, ab.getChannelData(0), 1 / 32768);
+  let ab;
+  if (b[0] === 4) {
+    // Full quality: rate u32, then 16-bit PCM (48 kHz for broadcast FM).
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const n = (b.length - 5) >> 1;
+    ab = ctx.createBuffer(1, n, dv.getUint32(1, true));
+    const ch = ab.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = dv.getInt16(5 + 2 * i, true) / 32768;
+  } else {
+    // Low data: IMA ADPCM at RATE.
+    const n = (b.length - 4) * 2;
+    ab = ctx.createBuffer(1, n, RATE);
+    adpcm(b, 1, n, ab.getChannelData(0), 1 / 32768);
+  }
   const now = ctx.currentTime;
   if (next < now + 0.02) next = now + LEAD;     // after a gap, rebuild a small buffer
   if (next > now + MAX_LAG) return;             // running ahead: drop to keep latency down

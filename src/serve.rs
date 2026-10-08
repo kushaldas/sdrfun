@@ -6,9 +6,11 @@
 //! `tx` event of the run so far. Saved transmissions carry a `url` (`/rec/<n>.wav`) that
 //! serves the recording, with byte ranges as iOS Safari requires for audio.
 //!
-//! Clients may send JSON text messages; `{"cmd": "lowdata", "on": bool}` is handled per
-//! client (fewer waterfall rows, `WATERFALL_TYPES`), everything else is forwarded to the
-//! hub's inbound channel.
+//! Clients may send JSON text messages, which are forwarded to the hub's inbound channel.
+//! A hub with an inbound channel (`sdrfun web`) sends typed binary messages (the first byte
+//! is the type) and handles `{"cmd": "lowdata", "on": bool}` per client: low-data clients
+//! get compressed audio (`AUDIO_LOW`) and fewer waterfall rows (`WATERFALL_TYPES`), the
+//! others full-quality audio (`AUDIO_FULL`).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
@@ -36,6 +38,9 @@ const HISTORY: usize = 500;
 const PAGE: &str = include_str!("serve.html");
 /// Binary message types (first byte) that "low data" clients receive only some of.
 pub const WATERFALL_TYPES: [u8; 2] = [2, 3];
+/// The same audio twice: compressed for low-data clients, and full quality for the others.
+pub const AUDIO_LOW: u8 = 1;
+pub const AUDIO_FULL: u8 = 4;
 /// A low-data client gets one in this many waterfall rows.
 const LOWDATA_EVERY: u32 = 4;
 /// How long a client thread waits for input before sending what is queued.
@@ -318,7 +323,9 @@ fn pump(
         return;
     }
     let mut lowdata = false;
-    let mut rows = 0u32;
+    // Per row type: the types arrive interleaved, so one shared count would always keep
+    // the same type.
+    let mut rows = [0u32; WATERFALL_TYPES.len()];
     loop {
         match ws.read() {
             Ok(Message::Text(text)) => {
@@ -341,13 +348,17 @@ fn pump(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             };
-            if let Message::Binary(b) = &msg
-                && lowdata
-                && b.first().is_some_and(|t| WATERFALL_TYPES.contains(t))
-            {
-                rows = rows.wrapping_add(1);
-                if !rows.is_multiple_of(LOWDATA_EVERY) {
+            // Only typed hubs (with an inbound channel); `listen` sends untyped PCM.
+            if let (Message::Binary(b), Some(_)) = (&msg, &inbound) {
+                let kind = b.first().copied().unwrap_or_default();
+                if kind == if lowdata { AUDIO_FULL } else { AUDIO_LOW } {
                     continue;
+                }
+                if lowdata && let Some(i) = WATERFALL_TYPES.iter().position(|&t| t == kind) {
+                    rows[i] = rows[i].wrapping_add(1);
+                    if !rows[i].is_multiple_of(LOWDATA_EVERY) {
+                        continue;
+                    }
                 }
             }
             if ws.send(msg).is_err() {
@@ -518,19 +529,24 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
         for _ in 0..8 {
             hub.binary(vec![2, 0, 0]);
+            hub.binary(vec![3, 0, 0]);
         }
-        hub.binary(vec![1, 9]);
+        hub.binary(vec![AUDIO_LOW, 9]);
+        hub.binary(vec![AUDIO_FULL, 9]);
         let count_rows = |ws: &mut tungstenite::WebSocket<TcpStream>| {
-            let mut rows = 0;
+            let mut rows = (0, 0);
             loop {
                 match ws.read().unwrap() {
-                    Message::Binary(m) if m[0] == 2 => rows += 1,
-                    Message::Binary(m) if m[0] == 1 => return rows,
+                    Message::Binary(m) if m[0] == 2 => rows.0 += 1,
+                    Message::Binary(m) if m[0] == 3 => rows.1 += 1,
+                    // Each client gets exactly one of the two audio messages.
+                    Message::Binary(m) if m[0] == AUDIO_LOW || m[0] == AUDIO_FULL => return (rows, m[0]),
                     _ => {}
                 }
             }
         };
-        assert_eq!(count_rows(&mut a), 8);
-        assert_eq!(count_rows(&mut b), 8 / LOWDATA_EVERY as usize);
+        assert_eq!(count_rows(&mut a), ((8, 8), AUDIO_FULL));
+        let thinned = 8 / LOWDATA_EVERY as usize;
+        assert_eq!(count_rows(&mut b), ((thinned, thinned), AUDIO_LOW));
     }
 }

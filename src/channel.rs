@@ -26,7 +26,10 @@ const WFM_DEVIATION_HZ: f32 = 75_000.0;
 pub const WFM_DEEMPHASIS_US: f32 = 50.0;
 /// Broadcast FM: demodulate at this rate, then keep the mono audio up to 15 kHz.
 const WFM_RATE: u32 = 240_000;
-const WFM_AUDIO_HZ: f32 = 15_000.0;
+/// Broadcast FM audio filter: flat to 15 kHz and down by > 70 dB at the 19 kHz stereo
+/// pilot (a Blackman window's transition is ~5.5 fs / taps wide, here 3.3 kHz).
+const WFM_AUDIO_TAPS: usize = 401;
+const WFM_AUDIO_CUTOFF_HZ: f32 = 16_800.0;
 /// Sidebands start this far from the suppressed carrier.
 const SSB_LOW_HZ: f32 = 300.0;
 /// CW beat note for a signal exactly on frequency.
@@ -75,7 +78,8 @@ impl Mode {
         match self {
             Mode::Am => 10_000.0,
             Mode::Nfm => 12_500.0,
-            Mode::Wfm => 180_000.0,
+            // As SDR++: wider lets in more noise without more audio.
+            Mode::Wfm => 150_000.0,
             Mode::Usb | Mode::Lsb => 2_400.0,
             Mode::Cw => 500.0,
         }
@@ -116,15 +120,16 @@ impl Mode {
             Mode::Am => (150.0, 4_000.0),
             // Above CTCSS tones.
             Mode::Nfm => (300.0, 3_400.0),
-            Mode::Wfm => (30.0, WFM_AUDIO_HZ),
+            Mode::Wfm => (30.0, 17_000.0),
             Mode::Usb | Mode::Lsb => (200.0, 3_000.0),
             Mode::Cw => (300.0, 1_500.0),
         }
     }
 
-    /// Default squelch, dB over the noise floor (`None` = open).
+    /// Default squelch, dB over the noise floor (`None` = open): for AM and NFM the same
+    /// margin the `listen` gate opens at.
     pub fn default_squelch(self) -> Option<f32> {
-        matches!(self, Mode::Am | Mode::Nfm).then_some(6.0)
+        matches!(self, Mode::Am | Mode::Nfm).then_some(crate::gate::DEFAULT_SQUELCH_MARGIN)
     }
 
     /// Whether voice cleanup is on by default.
@@ -380,7 +385,7 @@ impl Channel {
             Mode::Nfm => Demod::Fm(FmDemod::new(fs_f, FM_DEVIATION_HZ, FM_DEEMPHASIS_HZ)),
             Mode::Wfm => Demod::Wfm(
                 FmDemod::new(fs_f, WFM_DEVIATION_HZ, deemphasis_corner(WFM_DEEMPHASIS_US)),
-                Decimator::new(lowpass(81, WFM_AUDIO_HZ, fs_f), (fs / SAMPLE_RATE) as usize),
+                Decimator::new(lowpass(WFM_AUDIO_TAPS, WFM_AUDIO_CUTOFF_HZ, fs_f), (fs / SAMPLE_RATE) as usize),
                 Vec::new(),
             ),
             Mode::Usb | Mode::Lsb | Mode::Cw => Demod::Product(Product::new(mode, bandwidth_hz, fs as f64)),
@@ -751,5 +756,24 @@ mod tests {
         }
         assert_eq!(Mode::from_name("FM"), Some(Mode::Nfm));
         assert_eq!(Mode::from_name("dmr"), None);
+    }
+
+    #[test]
+    fn wfm_audio_is_flat_to_15_khz_and_drops_the_stereo_pilot() {
+        let fs = 960_000;
+        let level = |f: f64, dev: f64| {
+            let mut ch = Channel::new(fs, 200_000.0, 180_000.0, Mode::Wfm).unwrap();
+            let frames = run(&mut ch, &fm_iq(fs, 0.2, 0.3, move |t| 200_000.0 + dev * (2.0 * std::f64::consts::PI * f * t).sin()));
+            let audio: Vec<f32> = frames[5..].iter().flat_map(|f| f.audio).collect();
+            rms(&audio)
+        };
+        let deemph = |f: f64| 1.0 / (1.0 + (f / 3183.1).powi(2)).sqrt() * 1.048;
+        for f in [1_000.0, 8_000.0, 14_000.0] {
+            let gain = level(f, 75_000.0) / (0.354 * deemph(f) as f32);
+            assert!((gain - 1.0).abs() < 0.08, "{f} Hz: {gain:.3} of the de-emphasised level");
+        }
+        // The pilot is 10 % deviation; after de-emphasis it would be about -36 dBFS.
+        let pilot = 20.0 * level(19_000.0, 7_500.0).log10();
+        assert!(pilot < -85.0, "19 kHz pilot at {pilot:.1} dBFS");
     }
 }

@@ -1,34 +1,32 @@
-//! Manual squelch for the interactive receiver: opens when the channel is a set number of
-//! dB above a learned noise floor, with hysteresis and hang time. Like the gate, the floor
-//! is never raised by frames with a prominent carrier (AM/NFM), so a station that is
-//! already on when you tune in is not taken for the noise.
+//! Squelch for the interactive receiver. By default it opens and closes exactly like the
+//! `listen` gate (see `gate.rs`): open when the channel is `--squelch-margin` dB over a
+//! noise floor learned only from carrier-free frames (until the first such frame, carrier
+//! prominence alone opens it), stay open while within the hysteresis, then hang. The
+//! margin is adjustable from the page, or `None` to pass everything.
 
-/// Frames averaged for the level (30 ms).
+use crate::gate::{
+    DEFAULT_CARRIER_PROMINENCE, DEFAULT_HANG_S, FLOOR_FALL, FLOOR_RISE_IDLE, FLOOR_RISE_OPEN, HYSTERESIS_DB,
+    WARMUP_FRAMES,
+};
+
+/// Frames averaged for the displayed level (30 ms).
 const LEVEL_FRAMES: usize = 3;
-/// Floor tracking per 10 ms frame: drops quickly, rises slowly (faster while closed).
-const FLOOR_FALL: f32 = 0.3;
-const FLOOR_RISE_CLOSED_DB: f32 = 0.01;
-const FLOOR_RISE_OPEN_DB: f32 = 0.001;
-/// Treated as a signal when no threshold is set.
-const SIGNAL_DB: f32 = 6.0;
-/// Close only this far below the opening threshold.
-const HYSTERESIS_DB: f32 = 1.0;
-/// Stay open this many frames after the level drops (0.3 s).
-const HANG_FRAMES: u32 = 30;
+const HANG_FRAMES: u32 = (DEFAULT_HANG_S * 100.0) as u32;
 
 pub struct Squelch {
     /// dB over the floor needed to open; `None` keeps it always open.
     pub threshold: Option<f32>,
     floor: Option<f32>,
     recent: [f32; LEVEL_FRAMES],
-    filled: usize,
+    frames: u64,
     open: bool,
+    /// Frames since the carrier dropped while open.
     hang: u32,
 }
 
 impl Squelch {
     pub fn new(threshold: Option<f32>) -> Self {
-        Self { threshold, floor: None, recent: [0.0; LEVEL_FRAMES], filled: 0, open: false, hang: 0 }
+        Self { threshold, floor: None, recent: [0.0; LEVEL_FRAMES], frames: 0, open: false, hang: 0 }
     }
 
     /// Learn the floor again (after a gain or span change).
@@ -43,56 +41,48 @@ impl Squelch {
         }
     }
 
-    /// Feed one frame's channel power and whether it has a prominent carrier (always
-    /// `false` in modes without one); returns whether audio should pass.
-    pub fn push(&mut self, power_db: f32, carrier: bool) -> bool {
-        self.recent[self.filled % LEVEL_FRAMES] = power_db;
-        self.filled += 1;
-        let level = self.level_db();
-
-        match &mut self.floor {
-            // Until a carrier-free frame, a carrier alone opens.
-            None if carrier => {}
-            None => self.floor = Some(level),
-            Some(floor) if level < *floor => *floor += (level - *floor) * FLOOR_FALL,
-            Some(_) if carrier => {}
-            Some(floor) => {
-                // Rise slowly under a signal (so a long transmission is not taken as the
-                // floor), and faster otherwise, also when the squelch is off.
-                let signal = match self.threshold {
-                    Some(_) => self.open,
-                    None => level - *floor >= SIGNAL_DB,
-                };
-                let rise = if signal { FLOOR_RISE_OPEN_DB } else { FLOOR_RISE_CLOSED_DB };
-                *floor += (level - *floor).min(rise);
-            }
+    /// Feed one frame's channel power and carrier prominence (pass 0 in modes without a
+    /// carrier); returns whether audio should pass.
+    pub fn push(&mut self, power_db: f32, carrier_db: f32) -> bool {
+        self.recent[self.frames as usize % LEVEL_FRAMES] = power_db;
+        self.frames += 1;
+        if self.frames <= WARMUP_FRAMES {
+            // Filters still settling.
+            return self.threshold.is_none();
         }
 
-        let Some(threshold) = self.threshold else {
-            self.open = true;
-            return true;
+        let prominent = carrier_db >= DEFAULT_CARRIER_PROMINENCE;
+        let margin = self.threshold.unwrap_or(crate::gate::DEFAULT_SQUELCH_MARGIN);
+        let (opens, carrier) = match self.floor {
+            Some(floor) => (power_db > floor + margin, power_db > floor + margin - HYSTERESIS_DB),
+            None => (prominent, prominent),
         };
-        let above = match self.floor {
-            Some(floor) => level - floor,
-            None if carrier => threshold,
-            None => 0.0,
-        };
-        if above >= threshold {
-            self.open = true;
-            self.hang = HANG_FRAMES;
-        } else if self.open && above < threshold - HYSTERESIS_DB {
-            if self.hang == 0 {
-                self.open = false;
+        if self.open {
+            if carrier {
+                self.hang = 0;
             } else {
-                self.hang -= 1;
+                self.hang += 1;
+                if self.hang >= HANG_FRAMES {
+                    self.open = false;
+                }
+            }
+        } else if opens {
+            self.open = true;
+            self.hang = 0;
+        }
+        if !prominent {
+            let rise = if self.open { FLOOR_RISE_OPEN } else { FLOOR_RISE_IDLE };
+            match &mut self.floor {
+                Some(f) => *f += (power_db - *f) * if power_db < *f { FLOOR_FALL } else { rise },
+                None => self.floor = Some(power_db),
             }
         }
-        self.open
+        self.threshold.is_none() || self.open
     }
 
     /// Smoothed channel level, dBFS.
     pub fn level_db(&self) -> f32 {
-        let n = self.filled.clamp(1, LEVEL_FRAMES);
+        let n = (self.frames as usize).clamp(1, LEVEL_FRAMES);
         let mean = self.recent[..n].iter().map(|db| 10f32.powf(db / 10.0)).sum::<f32>() / n as f32;
         10.0 * mean.max(1e-12).log10()
     }
@@ -105,65 +95,46 @@ impl Squelch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::DEFAULT_SQUELCH_MARGIN;
+
+    fn feed(sq: &mut Squelch, db: f32, carrier: f32, n: usize) -> Vec<bool> {
+        (0..n).map(|_| sq.push(db, carrier)).collect()
+    }
 
     #[test]
-    fn opens_above_threshold_and_closes_after_hang() {
-        let mut sq = Squelch::new(Some(6.0));
-        for _ in 0..200 {
-            assert!(!sq.push(-60.0, false));
-        }
+    fn opens_at_the_margin_and_closes_after_hang_like_the_gate() {
+        let mut sq = Squelch::new(Some(DEFAULT_SQUELCH_MARGIN));
+        assert!(feed(&mut sq, -60.0, 0.0, 300).iter().all(|o| !o));
         assert!((sq.floor_db().unwrap() + 60.0).abs() < 0.1);
-        // 10 dB signal opens within the 3-frame level average.
-        let opened = (0..5).position(|_| sq.push(-50.0, false)).expect("opens");
-        assert!(opened <= 2);
-        for _ in 0..100 {
-            assert!(sq.push(-50.0, false), "stays open on the signal");
-        }
-        // Just under the threshold but within hysteresis: stays open.
-        for _ in 0..100 {
-            assert!(sq.push(-54.6, false));
-        }
-        // Back to the floor: closes after the hang time.
-        let closed = (0..100).position(|_| !sq.push(-60.0, false)).expect("closes");
-        assert!((HANG_FRAMES as usize..HANG_FRAMES as usize + 5).contains(&closed), "closed after {closed}");
+        // 7 dB is below the 8 dB margin: stays closed.
+        assert!(feed(&mut sq, -53.0, 0.0, 50).iter().all(|o| !o));
+        // 10 dB opens on the first frame.
+        assert!(sq.push(-50.0, 0.0));
+        // Within the 3 dB hysteresis: stays open indefinitely.
+        assert!(feed(&mut sq, -54.0, 0.0, 400).iter().all(|&o| o));
+        // Back to the noise: closes after the 1.5 s hang.
+        let closed = feed(&mut sq, -60.0, 0.0, 300).iter().position(|o| !o).expect("closes");
+        assert_eq!(closed, HANG_FRAMES as usize - 1);
     }
 
     #[test]
-    fn off_threshold_always_passes() {
-        let mut sq = Squelch::new(None);
-        assert!(sq.push(-90.0, false));
-        assert!(sq.push(-20.0, false));
-    }
-
-    #[test]
-    fn floor_follows_a_noise_rise_even_with_squelch_off() {
-        let mut sq = Squelch::new(None);
-        for _ in 0..100 {
-            sq.push(-62.0, false);
-        }
-        // Higher gain: the noise is now 4 dB up, below the signal level.
-        for _ in 0..500 {
-            sq.push(-58.0, false);
-        }
-        assert!((sq.floor_db().unwrap() + 58.0).abs() < 0.5, "floor {:?}", sq.floor_db());
-    }
-
-    #[test]
-    fn carrier_on_at_tune_in_is_not_taken_for_the_floor() {
-        let mut sq = Squelch::new(Some(6.0));
-        // A station already transmitting: open on the carrier, no floor yet.
-        for _ in 0..300 {
-            assert!(sq.push(-40.0, true));
-        }
+    fn carrier_on_at_tune_in_opens_and_is_not_taken_for_the_floor() {
+        let mut sq = Squelch::new(Some(DEFAULT_SQUELCH_MARGIN));
+        assert!(feed(&mut sq, -40.0, 30.0, 300)[10..].iter().all(|&o| o));
         assert_eq!(sq.floor_db(), None);
-        // It drops: the floor is learned from the noise and the squelch closes.
-        let closed = (0..100).position(|_| !sq.push(-70.0, false)).expect("closes");
-        assert!(closed < HANG_FRAMES as usize + 10);
+        // It drops: the floor is learned from the noise and the squelch closes after hang.
+        assert!(feed(&mut sq, -70.0, 0.0, 300).last() == Some(&false));
         assert!((sq.floor_db().unwrap() + 70.0).abs() < 1.0);
         // A long carrier later does not drag the floor up.
-        for _ in 0..3000 {
-            assert!(sq.push(-40.0, true));
-        }
+        assert!(feed(&mut sq, -40.0, 30.0, 3000).iter().all(|&o| o));
         assert!((sq.floor_db().unwrap() + 70.0).abs() < 1.0, "floor {:?}", sq.floor_db());
+    }
+
+    #[test]
+    fn off_passes_everything_but_still_learns_the_floor() {
+        let mut sq = Squelch::new(None);
+        assert!(feed(&mut sq, -62.0, 0.0, 200).iter().all(|&o| o));
+        assert!(sq.push(-20.0, 0.0));
+        assert!((sq.floor_db().unwrap() + 62.0).abs() < 0.5);
     }
 }

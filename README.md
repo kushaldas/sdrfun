@@ -47,11 +47,16 @@ The page shows a waterfall of the whole captured band (up to 2.4 MHz):
   the tuned channel. Drag the yellow tuning line to tune by hand. Tap the frequency to type one
   (`145.5`, `7074k`, `446006.25k`), or drag it sideways to step.
 - **Modes:** AM, NFM, WFM (mono), USB, LSB and CW.
-- **Squelch and cleanup:** the squelch slider works like a radio's (dB over the noise floor). A
-  separate *Voice cleanup* switch applies the RNNoise voice cleanup in any mode; it is on by default
-  for AM and NFM.
+- **Squelch and cleanup:** in AM and NFM the squelch starts out like `sdrfun listen`: it opens 8 dB
+  over the noise floor (or on a carrier that was already on when you tuned in), stays open for 1.5 s
+  after the carrier drops, and plays the 0.3 s before it opened. The SQL slider changes the margin;
+  slide it fully left to hear everything, hiss included. A separate *Voice cleanup* switch applies
+  the RNNoise voice cleanup in any mode; it is on by default for AM and NFM.
 - **Settings:** RF gain, span and filter bandwidth; per phone, a low-data mode and playing on with the
-  screen locked.
+  screen locked. Audio is sent uncompressed (about 770 kbit/s for FM broadcast, 380 kbit/s for the
+  voice modes); low data compresses it to about 100 kbit/s at some cost in quality.
+- **Gain:** strong FM stations overload the dongle at the default 32.8 dB gain. When the meter shows
+  *ADC CLIP*, lower the gain in Settings until it goes away.
 - **Bookmarks:** shared by every phone, kept in `bookmarks.json` and drawn on the waterfall. The
   lock-screen next/previous buttons step through them.
 
