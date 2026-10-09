@@ -1,0 +1,32 @@
+# sdrfun receiver in a container. The RTL-SDR dongle is passed through via
+# USB; the phone page is then on http://localhost:8010/.
+#
+#   docker compose up --build -d      # build and start
+#   docker compose logs -f            # follow the log
+#   docker compose down               # stop
+#
+# Change `command` to run another subcommand, e.g.
+#   command: ["listen", "120.150", "--serve", "0.0.0.0:8010", "--no-play"]
+
+services:
+  sdrfun:
+    build: .
+    image: sdrfun:latest
+    ports:
+      - "8010:8010"
+    # The dongle is a raw USB device; pass the bus through. For one device
+    # only, name it exactly instead, e.g. /dev/bus/usb/001/004.
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      - sdrfun-data:/data   # bookmarks.json and recordings survive restarts
+    environment:
+      # Largest FFT size (bins per waterfall row) the page may pick, and the one to start with.
+      SDRFUN_FFT_MAX: "8192"
+      SDRFUN_FFT: "2048"
+    # --no-play: the container has no sound card; audio goes to the browser.
+    command: ["web", "--no-play"]
+    restart: unless-stopped
+
+volumes:
+  sdrfun-data:

@@ -8,4 +8,13 @@ fn main() {
              Debian/Ubuntu: sudo apt install librtlsdr-dev\n\n"
         );
     }
+    // Same for libhackrf, which backs the HackRF One device.
+    if let Err(e) = pkg_config::Config::new().probe("libhackrf") {
+        panic!(
+            "\n\nlibhackrf development files not found ({e}).\n\
+             Install them and rebuild:\n  \
+             Fedora:        sudo dnf install hackrf-devel\n  \
+             Debian/Ubuntu: sudo apt install libhackrf-dev\n\n"
+        );
+    }
 }

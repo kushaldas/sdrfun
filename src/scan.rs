@@ -18,7 +18,7 @@ use crate::channel::{Channel, Mode};
 use crate::clean::{CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{GateConfig, GateEvent, Verdict};
 use crate::listen::{Receiver, Session};
-use crate::sdr::{Block, Control, Device, Gain};
+use crate::sdr::{Block, Control, Device, Gain, SdrSelect};
 
 /// Default survey: Stockholm Arlanda (ESSA) frequencies from public listings
 /// (OurAirports, SkyVector, RadioReference, Flight Plan Database), 2026-10.
@@ -53,6 +53,9 @@ pub struct ScanArgs {
     /// Rounds over all groups (0 = until Ctrl-C)
     #[arg(long, default_value_t = 0)]
     pub rounds: u32,
+    /// Radio to use: rtlsdr, hackrf or both (first one attached wins; env SDRFUN_SDR)
+    #[arg(long, value_enum, ignore_case = true, env = "SDRFUN_SDR")]
+    pub sdr: Option<SdrSelect>,
     /// RTL-SDR device index
     #[arg(long, default_value_t = 0)]
     pub device: u32,
@@ -178,7 +181,8 @@ pub fn run(args: ScanArgs) -> Result<()> {
     let bandwidth = args.bandwidth.unwrap_or(args.mode.default_bandwidth());
     let groups = plan_groups(&targets.iter().map(|t| t.mhz).collect::<Vec<_>>(), args.sample_rate);
 
-    let mut dev = Device::open(args.device)?;
+    let kind = crate::sdr::selected(SdrSelect::resolve(args.sdr))?[0];
+    let mut dev = Device::open(kind, args.device)?;
     let rate = dev.set_sample_rate(args.sample_rate)?;
     dev.set_ppm(args.ppm)?;
     let gain = dev.set_gain(args.gain)?;

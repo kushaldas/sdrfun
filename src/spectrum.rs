@@ -106,33 +106,72 @@ impl Spectrum {
     }
 }
 
-/// Colour-scale range that follows the noise floor and the strongest signals.
+/// Colour-scale range: follows the signals automatically until it has settled
+/// (a fixed number of rows), then freezes until the user sets it or re-arms.
 #[derive(Clone, Copy, Debug)]
 pub struct Levels {
     pub lo: f32,
     pub hi: f32,
+    /// True while the range is still auto-selecting itself.
+    pub auto: bool,
     started: bool,
+    rows: u32,
+    /// Rows of auto-following before the range freezes.
+    pub settle: u32,
 }
 
 impl Default for Levels {
     fn default() -> Self {
-        Self { lo: -110.0, hi: -40.0, started: false }
+        Self { lo: -110.0, hi: -40.0, auto: true, started: false, rows: 0, settle: 20 }
     }
 }
 
 impl Levels {
-    /// Update from a row (dB) and quantise it to 0..=255 over the range.
+    /// Start over: follow automatically again for `settle` rows.
+    pub fn rearm(&mut self) {
+        *self = Self { settle: self.settle, ..Default::default() };
+    }
+
+    /// Freeze the range at user-chosen values.
+    pub fn set_manual(&mut self, lo: f32, hi: f32) {
+        (self.lo, self.hi, self.auto, self.started) = (lo, hi.max(lo + 5.0), false, true);
+    }
+
+    /// Update from a row (dB) and quantise it to 0..=255 over the range. The floor and
+    /// top are percentiles (5th and 99th) so a single strong carrier or a noisy pass
+    /// cannot drag the scale around; the floor sits 8 dB under the noise so the trace
+    /// and waterfall have some headroom below it.
     pub fn quantize(&mut self, row: &[f32]) -> Vec<u8> {
-        let mut sorted = row.to_vec();
-        sorted.sort_by(f32::total_cmp);
-        let floor = sorted[sorted.len() / 5] - 5.0;
-        let peak = sorted[sorted.len() - 1] + 5.0;
-        let peak = peak.max(floor + 30.0);
-        if self.started {
-            self.lo += (floor - self.lo) * 0.05;
-            self.hi += (peak - self.hi) * 0.05;
-        } else {
-            (self.lo, self.hi, self.started) = (floor, peak, true);
+        self.quantize_dc(row, None)
+    }
+
+    /// As `quantize`, but `dc` = (centre, half-width) bins are ignored when picking
+    /// the range, so the tuner's DC spike cannot set the ceiling. The spike is
+    /// still painted at full strength; it just does not define the scale.
+    pub fn quantize_dc(&mut self, row: &[f32], dc: Option<(usize, usize)>) -> Vec<u8> {
+        if self.auto {
+            let mut sorted: Vec<f32> = match dc {
+                Some((c, half)) => row
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| i.abs_diff(c) > half)
+                    .map(|(_, &v)| v)
+                    .collect(),
+                None => row.to_vec(),
+            };
+            sorted.sort_by(f32::total_cmp);
+            let floor = sorted[sorted.len() / 20] - 8.0;
+            let top = sorted[sorted.len() - sorted.len() / 100].max(floor + 30.0);
+            if self.started {
+                self.lo += (floor - self.lo) * 0.02;
+                self.hi += (top - self.hi) * 0.02;
+                self.rows += 1;
+                if self.rows >= self.settle {
+                    self.auto = false;
+                }
+            } else {
+                (self.lo, self.hi, self.started) = (floor, top, true);
+            }
         }
         let span = (self.hi - self.lo).max(1.0);
         row.iter()
@@ -187,7 +226,31 @@ mod tests {
         let mut row = vec![-100.0; 1000];
         row[500] = -20.0;
         let q = levels.quantize(&row);
-        assert!(q[0] < 30, "floor {}", q[0]);
+        assert!(q[0] < 100, "floor {}", q[0]);
         assert!(q[500] > 220, "peak {}", q[500]);
+    }
+
+    #[test]
+    fn dc_spike_cannot_set_the_ceiling() {
+        let mut levels = Levels::default();
+        // Empty band with a huge DC spike dead centre (core + Hann skirt).
+        let mut row = vec![-90.0; 1024];
+        let c = row.len() / 2;
+        for d in 0..8 {
+            row[c + d] = -10.0;
+            if d > 0 {
+                row[c - d] = -10.0;
+            }
+        }
+        levels.quantize_dc(&row, Some((c, 4)));
+        assert!(
+            levels.hi < -60.0,
+            "ceiling {} should ignore the -10 dB spike",
+            levels.hi
+        );
+        // Without the exclusion the same spike drags the ceiling up.
+        let mut plain = Levels::default();
+        plain.quantize(&row);
+        assert!(plain.hi > levels.hi);
     }
 }

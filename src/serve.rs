@@ -1,10 +1,11 @@
 //! Web serving for phones. `Hub` is a small HTTP server for one page plus a WebSocket at
 //! `/ws`; `Streamer` uses it for `listen --serve`, `web.rs` for `sdrfun web`.
 //!
-//! `Streamer`: binary messages are mono 16-bit little-endian PCM at `STREAM_RATE`; text
-//! messages are JSON events (`status`, `open`, `tx`). A new client first receives every
-//! `tx` event of the run so far. Saved transmissions carry a `url` (`/rec/<n>.wav`) that
-//! serves the recording, with byte ranges as iOS Safari requires for audio.
+//! `Streamer`: binary messages are Opus packets with FEC (`AUDIO_OPUS`, see `opus.rs`);
+//! text messages are JSON events (`status`, `open`, `tx`). A new client first receives
+//! every `tx` event of the run so far. Saved transmissions carry a `url` (`/rec/<n>.wav`)
+//! that serves the recording, with byte ranges as iOS Safari requires for audio. The page
+//! decodes Opus with the bundled WASM decoder served at `/opus-decoder.js`.
 //!
 //! Clients may send JSON text messages, which are forwarded to the hub's inbound channel.
 //! A hub with an inbound channel (`sdrfun web`) sends typed binary messages (the first byte
@@ -24,31 +25,42 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tungstenite::Message;
 
-use crate::clean::SAMPLE_RATE;
-use crate::dsp::resample::Resampler;
-
-/// Streamed sample rate. Older iOS Safari rejects Web Audio buffers below 22.05 kHz.
-pub const STREAM_RATE: u32 = 24_000;
-/// Audio is sent in pieces of this many samples (100 ms).
-pub const CHUNK: usize = STREAM_RATE as usize / 10;
-/// Messages queued per client before it is considered too slow and audio is dropped.
-const CLIENT_QUEUE: usize = 64;
+/// Messages queued per client before it is considered too slow and messages are dropped.
+const CLIENT_QUEUE: usize = 512;
 /// Transmission events replayed to a newly connected page.
 const HISTORY: usize = 500;
 const PAGE: &str = include_str!("serve.html");
+/// The WASM Opus decoder the pages load (see `assets/`), served with its license
+/// notices (MIT for opus-decoder, BSD-3-Clause for the libopus inside it) as the
+/// licenses require of every copy.
+const OPUS_JS: &str = concat!(
+    "/*!\n",
+    include_str!("../assets/opus-decoder.LICENSE"),
+    "*/\n",
+    include_str!("../assets/opus-decoder.min.js")
+);
 /// Binary message types (first byte) that "low data" clients receive only some of.
 pub const WATERFALL_TYPES: [u8; 2] = [2, 3];
 /// The same audio twice: compressed for low-data clients, and full quality for the others.
 pub const AUDIO_LOW: u8 = 1;
 pub const AUDIO_FULL: u8 = 4;
+/// `listen --serve` audio: one Opus stream for everyone.
+pub const AUDIO_OPUS: u8 = 5;
 /// A low-data client gets one in this many waterfall rows.
 const LOWDATA_EVERY: u32 = 4;
 /// How long a client thread waits for input before sending what is queued.
 const POLL: Duration = Duration::from_millis(10);
 
+/// One connected page: its outbound queue plus the waterfall row type it displays
+/// (0 = all), so rows nobody looks at never enter the queue.
+struct Client {
+    tx: SyncSender<Message>,
+    want: std::sync::atomic::AtomicU8,
+}
+
 struct Shared {
     page: &'static str,
-    clients: Vec<SyncSender<Message>>,
+    clients: Vec<Arc<Client>>,
     /// `tx` events of this run, oldest first.
     history: VecDeque<String>,
     /// Latest message of each kind (e.g. receiver state), sent to every new client.
@@ -127,9 +139,8 @@ impl Hub {
 
 pub struct Streamer {
     hub: Hub,
-    resampler: Resampler,
-    scratch: Vec<f32>,
-    pending: Vec<i16>,
+    stream: crate::opus::Stream,
+    msgs: Vec<Vec<u8>>,
 }
 
 impl Streamer {
@@ -139,31 +150,25 @@ impl Streamer {
         let (hub, url) = Hub::start(addr, PAGE, None)?;
         let streamer = Self {
             hub,
-            resampler: Resampler::new(SAMPLE_RATE, STREAM_RATE),
-            scratch: Vec::new(),
-            pending: Vec::with_capacity(CHUNK),
+            stream: crate::opus::Stream::new(AUDIO_OPUS, 24, true)?,
+            msgs: Vec::new(),
         };
         Ok((streamer, url))
     }
 
     /// Queue 48 kHz audio for every connected listener.
     pub fn audio(&mut self, audio: &[f32]) {
-        let mut scratch = std::mem::take(&mut self.scratch);
-        scratch.clear();
-        self.resampler.process(audio, &mut scratch);
-        for &s in &scratch {
-            self.pending.push(to_i16(s));
-            if self.pending.len() == CHUNK {
-                self.send_pending();
-            }
+        self.stream.push(audio, &mut self.msgs);
+        for msg in self.msgs.drain(..) {
+            self.hub.binary(msg);
         }
-        self.scratch = scratch;
     }
 
     /// Send whatever audio is buffered (at the end of a transmission).
     pub fn flush(&mut self) {
-        if !self.pending.is_empty() {
-            self.send_pending();
+        self.stream.flush(&mut self.msgs);
+        for msg in self.msgs.drain(..) {
+            self.hub.binary(msg);
         }
     }
 
@@ -187,25 +192,24 @@ impl Streamer {
         shared.history.push_back(text.clone());
         broadcast(&mut shared, Message::Text(text.into()));
     }
-
-    fn send_pending(&mut self) {
-        let bytes: Vec<u8> = self.pending.iter().flat_map(|s| s.to_le_bytes()).collect();
-        self.pending.clear();
-        self.hub.binary(bytes);
-    }
-}
-
-/// Audio sample in [-1, 1] as 16-bit PCM.
-pub fn to_i16(s: f32) -> i16 {
-    (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
 }
 
 fn broadcast(shared: &mut Shared, msg: Message) {
     // A full queue means a slow client: skip this message for it. A closed
-    // queue means it disconnected: forget it.
-    shared
-        .clients
-        .retain(|c| !matches!(c.try_send(msg.clone()), Err(TrySendError::Disconnected(_))));
+    // queue means it disconnected: forget it. Waterfall rows the client does not
+    // display are skipped before queueing, so they can never crowd out audio.
+    let kind = match &msg {
+        Message::Binary(b) => b.first().copied().unwrap_or(0),
+        _ => 0,
+    };
+    let is_row = matches!(kind, 2 | 3 | 6);
+    shared.clients.retain(|c| {
+        let want = c.want.load(std::sync::atomic::Ordering::Relaxed);
+        if is_row && want != 0 && want != kind {
+            return true;
+        }
+        !matches!(c.tx.try_send(msg.clone()), Err(TrySendError::Disconnected(_)))
+    });
 }
 
 /// Serve the page and recordings for plain HTTP requests, or upgrade `/ws` to a WebSocket.
@@ -221,10 +225,14 @@ fn handle(stream: TcpStream, shared: SharedRef) -> Result<()> {
         let mut ws =
             tungstenite::accept(stream).map_err(|e| anyhow::anyhow!("websocket handshake: {e}"))?;
         let (tx, rx) = sync_channel(CLIENT_QUEUE);
+        let client = Arc::new(Client {
+            tx,
+            want: std::sync::atomic::AtomicU8::new(0),
+        });
         // Copy the greeting and register in one step, so no event is missed or doubled.
         let (greeting, inbound) = {
             let mut shared = lock(&shared);
-            shared.clients.push(tx);
+            shared.clients.push(client.clone());
             let greeting: Vec<String> =
                 shared.latest.values().chain(shared.history.iter()).cloned().collect();
             (greeting, shared.inbound.clone())
@@ -232,12 +240,21 @@ fn handle(stream: TcpStream, shared: SharedRef) -> Result<()> {
         for text in greeting {
             ws.send(Message::Text(text.into()))?;
         }
-        pump(ws, rx, inbound);
+        pump(ws, rx, inbound, client);
         return Ok(());
     }
 
     let mut stream = stream;
     let request = read_request(&mut stream)?;
+    if path == "/opus-decoder.js" {
+        return respond(
+            &mut stream,
+            "200 OK",
+            "text/javascript; charset=utf-8",
+            &["Cache-Control: public, max-age=86400".into()],
+            OPUS_JS.as_bytes(),
+        );
+    }
     if path == "/" || path.starts_with("/?") {
         let page = lock(&shared).page;
         return respond(&mut stream, "200 OK", "text/html; charset=utf-8", &[], page.as_bytes());
@@ -318,6 +335,7 @@ fn pump(
     mut ws: tungstenite::WebSocket<TcpStream>,
     rx: Receiver<Message>,
     inbound: Option<Sender<serde_json::Value>>,
+    client: Arc<Client>,
 ) {
     if ws.get_ref().set_read_timeout(Some(POLL)).is_err() {
         return;
@@ -332,6 +350,9 @@ fn pump(
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
                 if value["cmd"] == "lowdata" {
                     lowdata = value["on"].as_bool().unwrap_or(false);
+                } else if value["cmd"] == "want" {
+                    client.want.store(value["rows"].as_u64().unwrap_or(0) as u8,
+                        std::sync::atomic::Ordering::Relaxed);
                 } else if let Some(inbound) = &inbound {
                     let _ = inbound.send(value);
                 }
@@ -404,7 +425,7 @@ mod tests {
         reader.read_to_string(&mut rest).unwrap();
         assert!(rest.contains("<title>"), "page body served");
 
-        // WebSocket gets JSON events and PCM.
+        // WebSocket gets JSON events and Opus packets.
         let (mut ws, _) = tungstenite::client::client(
             format!("ws://{addr}/ws"),
             TcpStream::connect(&addr).unwrap(),
@@ -418,22 +439,28 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         streamer.event(serde_json::json!({"type": "open"}));
-        streamer.audio(&vec![0.25; SAMPLE_RATE as usize / 5]); // 200 ms
+        streamer.audio(&vec![0.25; 48_000 / 5]); // 200 ms at 48 kHz
         streamer.flush();
 
         let Message::Text(t) = ws.read().unwrap() else { panic!("expected text first") };
         assert!(t.contains("\"open\""));
-        let mut samples = 0;
-        while samples < STREAM_RATE as usize / 5 - 100 {
+        let mut dec = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+        let mut out = [0.0f32; 2 * 960];
+        let (mut samples, mut packets) = (0, 0);
+        while packets < 10 {
             match ws.read().unwrap() {
                 Message::Binary(b) => {
-                    assert_eq!(b.len() % 2, 0);
-                    samples += b.len() / 2;
+                    assert_eq!(b[0], AUDIO_OPUS);
+                    let (seq, cur, prev) = crate::opus::split(&b).unwrap();
+                    assert_eq!(seq, packets);
+                    assert_eq!(!prev.is_empty(), packets > 0, "FEC copy from the second packet on");
+                    samples += dec.decode_float(cur, &mut out, false).unwrap();
+                    packets += 1;
                 }
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert!(samples <= STREAM_RATE as usize / 5);
+        assert_eq!(samples, 48_000 / 5);
     }
 
     /// Send a raw HTTP request; return the status line, headers and body.

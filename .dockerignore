@@ -1,0 +1,7 @@
+target/
+.git/
+recordings/
+bookmarks.json
+*.wav
+Dockerfile
+docker-compose.yml

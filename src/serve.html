@@ -82,12 +82,26 @@
   <audio id="player" preload="none"></audio>
 </main>
 
+<script src="/opus-decoder.js"></script>
 <script>
-const RATE = 24000;          // must match STREAM_RATE in serve.rs
+const OPUS_RATE = 48000;       // live audio is 48 kHz mono Opus (opus.rs)
 const LEAD = 0.25;           // seconds of buffering when audio (re)starts
 const $ = (id) => document.getElementById(id);
 let ctx = null, gain = null, ws = null, next = 0, playing = false, wakeLock = null;
 let receivedS = 0;
+let opus = null, opusInit = null, expect;       // expect = last packet sequence
+
+// The WASM libopus decoder (assets/opus-decoder.min.js, served at /opus-decoder.js).
+function initOpus() {
+  if (!opusInit) opusInit = (async () => {
+    const D = window['opus-decoder'] && window['opus-decoder'].OpusDecoder;
+    if (!D) throw new Error('decoder script missing');
+    const d = new D({ sampleRate: OPUS_RATE, channels: 1 });
+    await d.ready;
+    return d;
+  })();
+  return opusInit;
+}
 
 // iOS mutes Web Audio with the silent switch unless the page also plays an HTML
 // media element (navigator.audioSession, the proper fix, needs https). A looping
@@ -134,15 +148,26 @@ function connect() {
   };
 }
 
+// One Opus packet (opus.rs): kind 5, seq u32, cur len u16, prev len u16, cur, prev (FEC).
 function onAudio(buf) {
-  if (!ctx || !playing) return;
+  if (!ctx || !playing || !opus) return;
   // iOS may suspend or interrupt the context (calls, other apps); try to get it back.
   if (ctx.state !== 'running') ctx.resume().catch(() => {});
-  const pcm = new Int16Array(buf);
-  receivedS += pcm.length / RATE;
-  const ab = ctx.createBuffer(1, pcm.length, RATE);
-  const ch = ab.getChannelData(0);
-  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const b = new Uint8Array(buf), dv = new DataView(buf);
+  const seq = dv.getUint32(1, true), curLen = dv.getUint16(5, true), prevLen = dv.getUint16(7, true);
+  const cur = b.subarray(9, 9 + curLen), prev = prevLen ? b.subarray(9 + curLen, 9 + curLen + prevLen) : null;
+  if (expect !== undefined && seq <= expect) return;                       // stale or duplicate
+  if (prev && expect !== undefined && seq === expect + 2) play(opus.decodeFrame(prev)); // FEC: fills the one gap
+  expect = seq;
+  play(opus.decodeFrame(cur));
+}
+
+function play(decoded) {
+  const data = decoded.channelData && decoded.channelData[0];
+  if (!data || !data.length) return;
+  receivedS += data.length / OPUS_RATE;
+  const ab = ctx.createBuffer(1, data.length, OPUS_RATE);
+  ab.getChannelData(0).set(data);
   const src = ctx.createBufferSource();
   src.buffer = ab;
   src.connect(gain);
@@ -228,8 +253,13 @@ async function start() {
   playing = true;
   next = 0;
   receivedS = 0;
+  expect = undefined;
   showAudio();
   await resumed.catch(() => {});
+  if (!opus) {
+    try { opus = await initOpus(); }
+    catch (e) { $('audioInfo').textContent = 'Opus decoder failed to load: ' + e; }
+  }
   showAudio();
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
   $('play').textContent = 'Stop';
