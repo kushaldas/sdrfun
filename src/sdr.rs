@@ -573,16 +573,21 @@ impl Device {
         }
     }
 
-    /// Start the sample pump (HackRF only; the RTL reads synchronously).
+    /// Make the radio ready to read. The HackRF starts its callback pump. The RTL-SDR
+    /// reads synchronously, but librtlsdr requires `rtlsdr_reset_buffer` before the
+    /// first `rtlsdr_read_sync`; without it every read fails with LIBUSB_ERROR_PIPE (-9).
     pub fn start_streaming(&mut self) -> Result<()> {
-        if let Device::Hackrf(d) = self
-            && !d.streaming
-        {
-            let ctx = &d.rx as *const Mutex<VecDeque<u8>> as *mut c_void;
-            check(unsafe { hackrf_start_rx(d.dev, hackrf_rx_cb, ctx) }, "start_rx")?;
-            d.streaming = true;
+        match self {
+            Device::Rtlsdr(d) => check(unsafe { rtlsdr_reset_buffer(d.dev) }, "reset_buffer"),
+            Device::Hackrf(d) => {
+                if !d.streaming {
+                    let ctx = &d.rx as *const Mutex<VecDeque<u8>> as *mut c_void;
+                    check(unsafe { hackrf_start_rx(d.dev, hackrf_rx_cb, ctx) }, "start_rx")?;
+                    d.streaming = true;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn stop_streaming(&mut self) {
@@ -685,10 +690,7 @@ impl Device {
             Device::Hackrf(d) => d.last_rate.unwrap_or(2_400_000),
         };
         let mut settings = 0u32;
-        match &self {
-            Device::Rtlsdr(d) => check(unsafe { rtlsdr_reset_buffer(d.dev) }, "reset_buffer")?,
-            Device::Hackrf(_) => self.start_streaming()?,
-        }
+        self.start_streaming()?;
         while !stop.load(Ordering::Relaxed) {
             let (mut want_center, mut want_gain, mut want_rate) = (None, None, None);
             for c in control.iter().flat_map(|r| r.try_iter()) {
@@ -836,10 +838,15 @@ pub fn pump(
         if want != sweeping {
             sweeping = want;
             sweeper.set_levels(rig.levels);
-            // The sweep left the tuner and filters somewhere else; go back to the channel.
+            // The sweep left the tuner and filters somewhere else; go back to the channel
+            // and drop what was captured on the way.
             rig.apply_all()?;
             (cur_center, cur_rate, cur_gain) = (rig.center, rig.rate, rig.gain);
             settings = settings.wrapping_add(1);
+            if !sweeping {
+                rig.sources[rig.active].reset_buffer();
+                let _ = rig.sources[rig.active].read(READ_LEN / 2, Duration::from_secs(1));
+            }
         }
         if let Some((a, b)) = rig.sweep {
             // Sweeps always run with a fixed gain: an AGC (or the low auto default)

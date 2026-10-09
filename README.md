@@ -13,7 +13,7 @@ screen, with a wideband sweep mode that hops the tuner across many MHz to find s
 | libhackrf (HackRF One) | `sudo dnf install hackrf hackrf-devel` | `sudo apt install hackrf libhackrf-dev` |
 | ALSA (audio output) | `sudo dnf install alsa-lib-devel` | `sudo apt install libasound2-dev` |
 | libopus (streamed audio) | `sudo dnf install opus-devel` | `sudo apt install libopus-dev` |
-| pkg-config, C compiler | `sudo dnf install pkgconf-pkg-config gcc` | `sudo apt install pkg-config build-essential` |
+| pkg-config, C compiler, cmake | `sudo dnf install pkgconf-pkg-config gcc cmake` | `sudo apt install pkg-config build-essential cmake` |
 
 ```
 cargo build --release
