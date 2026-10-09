@@ -375,7 +375,7 @@ impl Radio {
                 }
                 let lo = cmd["lo"].as_f64().ok_or_else(|| anyhow!("levels needs lo and hi"))? as f32;
                 let hi = cmd["hi"].as_f64().ok_or_else(|| anyhow!("levels needs lo and hi"))? as f32;
-                if !(hi > lo) {
+                if hi.partial_cmp(&lo) != Some(std::cmp::Ordering::Greater) {
                     bail!("ceiling must be above floor");
                 }
                 self.levels = Some((lo, hi));
