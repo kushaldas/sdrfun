@@ -53,6 +53,25 @@
   .readout.editing input { opacity: 1; }
   .readout.editing .show { visibility: hidden; }
   .side { display: grid; justify-items: end; gap: 4px; }
+  .sweepbtn { /* sweep mode, beside the VFO: a little spectrum behind the same glass */
+    flex: none; align-self: stretch; width: 60px; padding: 0; display: grid; place-items: center; align-content: center; gap: 3px;
+    border-radius: 10px; border: 1px solid #2a2010; color: #a77a35; cursor: pointer;
+    background: radial-gradient(120% 140% at 50% 0%, #1a1306 0%, #0a0806 70%);
+    font: 700 .56rem/1 var(--mono); letter-spacing: .14em; transition: color .15s, border-color .15s, box-shadow .15s;
+  }
+  .sweepbtn svg { width: 30px; height: 20px; overflow: hidden; }
+  .sweepbtn .trace { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+  .sweepbtn .beam { stroke: currentColor; stroke-width: 1.5; opacity: 0; }
+  .sweepbtn:active { transform: translateY(1px); filter: brightness(1.25); }
+  .sweepbtn.on {
+    color: var(--teal); border-color: #1d6b5f; text-shadow: 0 0 8px rgba(63,224,197,.6);
+    background: radial-gradient(120% 140% at 50% 0%, #0b2622 0%, #050c0b 70%);
+    box-shadow: 0 0 0 1px rgba(63,224,197,.2), 0 0 14px rgba(63,224,197,.22);
+  }
+  .sweepbtn.on .trace { filter: drop-shadow(0 0 2px rgba(63,224,197,.8)); }
+  .sweepbtn.on .beam { opacity: .85; animation: beam 1.6s linear infinite; }
+  @keyframes beam { from { transform: translateX(0); } to { transform: translateX(29px); } }
+  @media (prefers-reduced-motion: reduce) { .sweepbtn.on .beam { animation: none; transform: translateX(15px); } }
   .modetag { font: 700 .8rem var(--mono); color: var(--ink); background: var(--amber); border-radius: 5px; padding: 2px 7px; letter-spacing: .06em; }
   .conn { display: inline-flex; align-items: center; gap: 5px; font-size: .7rem; color: var(--dim); }
   .conn i { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
@@ -67,12 +86,12 @@
   .levels { display: flex; justify-content: space-between; font: .72rem var(--mono); color: var(--dim); margin-top: 3px; font-variant-numeric: tabular-nums; }
 
   /* ── display ─────────────────────────────────────────── */
-  .display { position: relative; display: grid; grid-template-rows: 92px minmax(0, 1fr); min-height: 0; overflow: hidden; background: #030406; touch-action: none; }
+  .display { position: relative; display: grid; grid-template-rows: 92px 18px minmax(0, 1fr); min-height: 0; overflow: hidden; background: #030406; touch-action: none; }
   canvas { display: block; width: 100%; height: 100%; }
   #wf { image-rendering: pixelated; }
   .tuneline { position: absolute; top: 0; bottom: 0; width: 0; pointer-events: none; }
   .tuneline::before { /* the line through the waterfall */
-    content: ""; position: absolute; top: 92px; bottom: 0; left: -0.5px; width: 1px; background: rgba(255,181,71,.55);
+    content: ""; position: absolute; top: 110px; bottom: 0; left: -0.5px; width: 1px; background: rgba(255,181,71,.55);
   }
   .tuneline i { /* grip at the bottom of the spectrum: drag it to tune */
     position: absolute; top: 74px; left: -15px; width: 30px; height: 18px; border-radius: 9px;
@@ -86,6 +105,13 @@
     background: rgba(7,9,12,.75); border: 1px solid var(--line); padding: 2px 6px; border-radius: 6px; pointer-events: none;
   }
   .zoomtag.detail { color: var(--amber); border-color: var(--amber-dim); }
+  .sweepnote {
+    position: absolute; left: 8px; top: 98px; font: .7rem var(--mono); color: var(--teal);
+    background: rgba(7,9,12,.75); border: 1px solid var(--line); padding: 2px 6px; border-radius: 6px; pointer-events: none;
+  }
+  .tools { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; }
+  .swrow { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; }
+  .swrow input { min-width: 0; height: 46px; border-radius: var(--r); border: 1px solid var(--line); background: var(--ink); color: var(--text); padding: 0 10px; font: 16px var(--mono); }
 
   /* ── controls ────────────────────────────────────────── */
   .controls {
@@ -159,6 +185,7 @@
     .controls { grid-column: 2; grid-row: 1 / 3; border-top: 0; border-left: 1px solid var(--line); align-content: center; overflow: auto;
                 padding-right: calc(12px + env(safe-area-inset-right)); }
     .readout { font-size: 2rem; }
+    .sweepbtn { width: 52px; }
     .row3 { grid-template-columns: 1fr 1fr; }
     .toast { bottom: calc(16px + env(safe-area-inset-bottom)); left: 35%; }
   }
@@ -176,6 +203,13 @@
         <input id="fin" type="text" inputmode="decimal" enterkeyhint="go" autocomplete="off" autocorrect="off"
                spellcheck="false" aria-label="Frequency in MHz (or with k for kHz); drag sideways to step">
       </div>
+      <button class="sweepbtn" id="sweepbtn" aria-pressed="false" aria-label="Sweep mode: scan a wide band, spectrum only (no audio)">
+        <svg viewBox="0 0 30 20" aria-hidden="true">
+          <polyline class="trace" points="1,17 6,17 8,12 10,17 13,17 15.5,4 18,17 21,17 23,11 25,17 29,17"/>
+          <line class="beam" x1="0.5" y1="1" x2="0.5" y2="19"/>
+        </svg>
+        <span>SWEEP</span>
+      </button>
       <div class="side">
         <span class="modetag" id="modetag">—</span>
         <span class="conn" id="conn"><i></i><span id="connText">offline</span></span>
@@ -188,13 +222,16 @@
 
   <div class="display" id="display">
     <canvas id="spec"></canvas>
+    <canvas id="band"></canvas>
     <canvas id="wf"></canvas>
     <div class="tuneline" id="tuneline" hidden><i></i></div>
     <span class="zoomtag" id="zoomtag"></span>
+    <span class="sweepnote" id="sweepnote" hidden>SWEEP · spectrum only · pinch/drag to set the range</span>
   </div>
 
   <div class="controls">
     <div class="modes" id="modes"></div>
+    <div class="tools" id="tools" hidden></div>
     <div class="tune">
       <button class="btn" id="down" aria-label="Step down">◀</button>
       <div class="sqlbox">
@@ -235,6 +272,26 @@
     <div class="seg" id="spans"></div>
   </div>
   <div class="field">
+    <div class="lbl"><span>FFT size</span><b id="fftlbl">—</b></div>
+    <div class="seg" id="ffts"></div>
+  </div>
+  <div class="field">
+    <div class="lbl"><span>Scope range</span><b id="rangelbl">auto</b></div>
+    <div class="lbl"><span>Floor</span><b id="floorlbl">—</b></div>
+    <input type="range" id="scopelo" min="-140" max="-5" step="1" value="-90" aria-label="Waterfall floor in dBFS">
+    <div class="lbl"><span>Ceiling</span><b id="ceillbl">—</b></div>
+    <input type="range" id="scopehi" min="-135" max="0" step="1" value="-40" aria-label="Waterfall ceiling in dBFS">
+    <button class="btn" id="lvlauto">Re-scan range</button>
+  </div>
+  <div class="field" id="sweeprange" hidden>
+    <div class="lbl"><span>Sweep range (MHz)</span><b id="swlbl">—</b></div>
+    <div class="swrow">
+      <input id="swstart" type="text" inputmode="decimal" placeholder="Start" aria-label="Sweep start in MHz">
+      <input id="swend" type="text" inputmode="decimal" placeholder="End" aria-label="Sweep end in MHz">
+      <button class="btn" id="swgo">Go</button>
+    </div>
+  </div>
+  <div class="field">
     <div class="lbl"><span>Filter bandwidth</span><b id="bwlbl">—</b></div>
     <input type="range" id="bw" min="0" max="1" step="1" value="0">
   </div>
@@ -255,9 +312,10 @@
 <div class="toast" id="toast" hidden></div>
 <audio id="bgAudio" playsinline></audio>
 
+<script src="/opus-decoder.js"></script>
 <script>
 'use strict';
-const RATE = 24000;            // STREAM_RATE in serve.rs (low-data audio)
+const OPUS_RATE = 48000;       // every audio stream is 48 kHz mono Opus (opus.rs)
 const LEAD = 0.25;             // seconds buffered when audio (re)starts
 const MAX_LAG = 1.0;           // drop audio once this far ahead (SDR clock faster than the phone's)
 const ROW_HEADER = 19;         // web.rs
@@ -270,7 +328,8 @@ let bookmarks = [];
 let meter = null;
 let ws = null;
 const view = { center: 0, span: 0 };
-const rows = { 2: [], 3: [] }; // 2 = wideband, 3 = detail around the tuned frequency
+const rows = { 2: [], 3: [], 6: [] }; // 2 = wideband, 3 = detail, 6 = sweep
+const sweepOn = () => !!(S && S.sweep);
 const prefs = loadPrefs();
 
 function loadPrefs() {
@@ -325,6 +384,7 @@ function connect() {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     $('conn').className = 'conn on'; $('connText').textContent = 'live';
+    lastSrc = null; // re-announce the displayed row type to the fresh connection
     if (prefs.lowdata) send({ cmd: 'lowdata', on: true });
   };
   ws.onmessage = (e) => (typeof e.data === 'string' ? onEvent(JSON.parse(e.data)) : onBinary(new Uint8Array(e.data)));
@@ -343,15 +403,16 @@ function onEvent(ev) {
 
 function onBinary(b) {
   if (b[0] === 1 || b[0] === 4) return onAudio(b);
-  if (b[0] !== 2 && b[0] !== 3) return;
+  if (b[0] !== 2 && b[0] !== 3 && b[0] !== 6) return;
   const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   const bins = dv.getUint16(17, true);
   const levels = new Uint8ClampedArray(bins);   // ADPCM can overshoot 0..255 slightly
   adpcm(b, ROW_HEADER, bins, levels, 1 / ROW_SCALE);
   const list = rows[b[0]];
-  list.unshift({ center: dv.getUint32(1, true), span: dv.getUint32(5, true), bins, levels });
+  list.unshift({ center: dv.getUint32(1, true), span: dv.getUint32(5, true), bins, levels,
+                 lo: dv.getFloat32(9, true), hi: dv.getFloat32(13, true) });
   if (list.length > MAX_ROWS) list.length = MAX_ROWS;
-  if ((b[0] === 3) === useDetail()) newRow = true;
+  if ((b[0] === 3 && useDetail()) || (b[0] === 2 && !useDetail() && !sweepOn()) || (b[0] === 6 && sweepOn())) pending++;
   dirty(false);
 }
 
@@ -371,6 +432,11 @@ function onState(s) {
       b.onclick = () => { haptic(); send({ cmd: 'mode', mode: m.name }); };
       $('modes').appendChild(b);
     }
+  }
+  // Span chips depend on the active radio, so rebuild them when the list changes.
+  const spanKey = s.spans.join(',');
+  if ($('spans').dataset.key !== spanKey) {
+    $('spans').dataset.key = spanKey;
     $('spans').innerHTML = '';
     for (const r of s.spans) {
       const b = document.createElement('button');
@@ -379,8 +445,37 @@ function onState(s) {
       $('spans').appendChild(b);
     }
   }
+  // FFT size chips: powers of two up to the server's --fft-max.
+  const fftKey = (s.fft_sizes || []).join(',');
+  if ($('ffts').dataset.key !== fftKey) {
+    $('ffts').dataset.key = fftKey;
+    $('ffts').innerHTML = '';
+    for (const n of s.fft_sizes || []) {
+      const b = document.createElement('button');
+      b.className = 'chip'; b.textContent = n >= 1024 ? n / 1024 + 'K' : n + ''; b.dataset.size = n;
+      b.onclick = () => { haptic(); send({ cmd: 'fft', size: n }); };
+      $('ffts').appendChild(b);
+    }
+  }
+  for (const b of $('ffts').children) b.classList.toggle('on', +b.dataset.size === s.fft);
+  // A sweep row has at most this many bins (fewer when the hops measured fewer).
+  $('fftlbl').textContent = sweepOn() ? 'up to ' + s.fft + ' bins'
+    : s.fft + ' bins · ' + fmtHz(s.rate / s.fft) + 'Hz/bin';
+  // Scope range sliders follow the server unless the user is moving them.
+  const L = s.levels || {};
+  if (!levelsBusy()) showLevels(L.lo ?? -90, L.hi ?? -40, L.auto);
   for (const b of $('modes').children) b.classList.toggle('on', b.dataset.mode === s.mode);
   for (const b of $('spans').children) b.classList.toggle('on', +b.dataset.rate === s.rate);
+  renderTools();
+  setToggle('sweepbtn', sweepOn());
+  $('sweepbtn').setAttribute('aria-pressed', sweepOn());
+  $('sweeprange').hidden = !sweepOn();
+  $('sweepnote').hidden = !sweepOn();
+  if (sweepOn()) {
+    $('swlbl').textContent = fmtHz(s.sweep.end - s.sweep.start) + 'Hz wide';
+    if (document.activeElement !== $('swstart')) $('swstart').value = +(s.sweep.start / 1e6).toFixed(4);
+    if (document.activeElement !== $('swend')) $('swend').value = +(s.sweep.end / 1e6).toFixed(4);
+  }
   $('spanlbl').textContent = fmtMHz(s.rate, 2) + ' MHz';
   $('steplbl').textContent = 'step ' + fmtHz(s.step_hz);
   setSquelchUi(s.squelch);
@@ -401,8 +496,18 @@ function onState(s) {
   $('bwlbl').textContent = fmtHz(s.bandwidth) + 'Hz';
 
   // View: start on the whole band, and follow the receiver when it moves out of sight.
-  if (first || view.span > s.rate || !prev || prev.rate !== s.rate) { view.span = s.rate; view.center = s.center_hz; }
-  if (s.hz < view.center - view.span / 2 || s.hz > view.center + view.span / 2) view.center = s.hz;
+  if (sweepOn()) {
+    // The view is the sweep window; adopt it when the server moves the sweep (but not
+    // mid-gesture, where the local view is already ahead of the server).
+    const was = prev && prev.sweep;
+    if (!was || was.start !== s.sweep.start || was.end !== s.sweep.end) {
+      view.span = s.sweep.end - s.sweep.start;
+      view.center = (s.sweep.start + s.sweep.end) / 2;
+    }
+  } else {
+    if (first || view.span > s.rate || !prev || prev.rate !== s.rate) { view.span = s.rate; view.center = s.center_hz; }
+    if (s.hz < view.center - view.span / 2 || s.hz > view.center + view.span / 2) view.center = s.hz;
+  }
   clampView();
   renderBookmarks();
   updateTitle();
@@ -447,6 +552,56 @@ function nearestIndex(list, v) {
 }
 function setToggle(id, on) { $(id).classList.toggle('on', !!on); }
 
+// ── radio switching + sweep mode (the button beside the VFO) ────────────────────────────────────
+function renderTools() {
+  const t = $('tools');
+  const sdrs = (S && S.sdrs) || [];
+  t.hidden = sdrs.length < 2;
+  if (t.hidden) return;
+  if (!t.dataset.built) {
+    t.innerHTML = '';
+    for (const d of sdrs) {
+      const b = document.createElement('button');
+      b.className = 'chip'; b.textContent = d.toUpperCase(); b.dataset.sdr = d;
+      b.onclick = () => { haptic(); send({ cmd: 'sdr', which: d }); };
+      t.appendChild(b);
+    }
+    t.dataset.built = '1';
+  }
+  for (const b of t.children) b.classList.toggle('on', b.dataset.sdr === S.sdr);
+}
+
+function toggleSweep() {
+  if (!S) return;
+  haptic();
+  if (sweepOn()) { send({ cmd: 'sweep', on: false }); return; }
+  const lo = S.freq_min_hz, hi = S.freq_max_hz, w = Math.min(S.rate * 8, (hi - lo) / 4);
+  let a = S.hz - w / 2;
+  a = Math.max(lo, Math.min(hi - w, a));
+  send({ cmd: 'sweep', on: true, start: Math.round(a), end: Math.round(a + w) });
+}
+
+let sweepSent = 0, sweepTimer = null;
+/** Push the current view to the server as the new sweep window (debounced). */
+function sendSweepView() {
+  clearTimeout(sweepTimer);
+  const go = () => {
+    sweepSent = performance.now();
+    send({ cmd: 'sweep', on: true, start: Math.round(view.center - view.span / 2), end: Math.round(view.center + view.span / 2) });
+  };
+  const wait = 200 - (performance.now() - sweepSent);
+  if (wait <= 0) go(); else sweepTimer = setTimeout(go, wait);
+}
+
+function sweepGo() {
+  if (!S) return;
+  const a = parseFreq($('swstart').value), b = parseFreq($('swend').value);
+  if (a === null || b === null || b <= a) { toast('Enter a start and end frequency in MHz, e.g. 144 and 148'); return; }
+  haptic();
+  $('swstart').blur(); $('swend').blur();
+  send({ cmd: 'sweep', on: true, start: Math.round(a), end: Math.round(b) });
+}
+
 // ── tuning helpers ──────────────────────────────────────────────────
 function snap(hz) { const st = S.step_hz; return Math.round(hz / st) * st; }
 function tune(hz) { if (S) send({ cmd: 'tune', hz: Math.round(hz) }); }
@@ -473,9 +628,9 @@ function nextBookmark(dir) {
 }
 
 // ── waterfall + spectrum ────────────────────────────────────────────
-const spec = $('spec'), wf = $('wf');
-const sctx = spec.getContext('2d'), wctx = wf.getContext('2d');
-let wfImg = null, needFull = true, newRow = false, frameQueued = false, lastSrc = null;
+const spec = $('spec'), wf = $('wf'), band = $('band');
+const sctx = spec.getContext('2d'), wctx = wf.getContext('2d'), bctx = band.getContext('2d');
+let wfImg = null, needFull = true, pending = 0, frameQueued = false, lastSrc = null;
 const LUT = makePalette([[0, '#04060a'], [0.22, '#0a1a3f'], [0.42, '#13527d'], [0.58, '#1cae9c'],
                          [0.74, '#e7c246'], [0.88, '#ff7a3d'], [1, '#fff3df']]);
 
@@ -498,6 +653,7 @@ function makePalette(stops) {
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   spec.width = Math.round(spec.clientWidth * dpr); spec.height = Math.round(spec.clientHeight * dpr);
+  band.width = Math.max(1, Math.round(band.clientWidth * dpr)); band.height = Math.max(1, Math.round(band.clientHeight * dpr));
   // The waterfall is drawn at CSS-pixel resolution: one line per row, cheap to redraw.
   wf.width = Math.max(1, Math.round(wf.clientWidth)); wf.height = Math.max(1, Math.round(wf.clientHeight));
   wfImg = wctx.createImageData(wf.width, wf.height);
@@ -505,18 +661,25 @@ function resize() {
 }
 
 function useDetail() {
-  const d = rows[3][0];
-  if (!d || !S) return false;
-  return view.span <= d.span * 0.9 && Math.abs(view.center - d.center) + view.span / 2 <= d.span / 2;
+  if (!S || sweepOn() || !S.detail_hz) return false;
+  return view.span <= S.detail_hz * 0.9 && Math.abs(view.center - S.hz) + view.span / 2 <= S.detail_hz / 2;
 }
 
 function dirty(full) {
   if (full) needFull = true;
-  if (!frameQueued) { frameQueued = true; requestAnimationFrame(draw); }
+  if (frameQueued) return;
+  frameQueued = true;
+  requestAnimationFrame(draw);
 }
 
 function clampView() {
   if (!S) return;
+  if (sweepOn()) {
+    const lo = S.freq_min_hz, hi = S.freq_max_hz;
+    view.span = Math.min(hi - lo, Math.max(S.rate, view.span));
+    view.center = Math.min(hi - view.span / 2, Math.max(lo + view.span / 2, view.center));
+    return;
+  }
   const minSpan = 4000;
   view.span = Math.min(S.rate, Math.max(minSpan, view.span));
   const lo = S.center_hz - S.rate / 2 + view.span / 2, hi = S.center_hz + S.rate / 2 - view.span / 2;
@@ -547,25 +710,31 @@ function draw() {
   if (!wfImg || !S) return;
   const W = wf.width, H = wf.height;
   const detail = useDetail();
-  const src = rows[detail ? 3 : 2];
-  if (lastSrc !== detail) { needFull = true; lastSrc = detail; }
+  const kind = sweepOn() ? 6 : detail ? 3 : 2;
+  const src = rows[kind];
+  if (lastSrc !== kind) { needFull = true; lastSrc = kind; send({ cmd: 'want', rows: kind }); }
   const buf = new Uint32Array(wfImg.data.buffer);
   if (needFull) {
     buf.fill(LUT[0]);
     for (let y = 0; y < Math.min(H, src.length); y++) paintRow(buf, y, W, src[y]);
     wctx.putImageData(wfImg, 0, 0);
-  } else if (newRow && src.length) {
-    buf.copyWithin(W, 0, W * (H - 1));
-    paintRow(buf, 0, W, src[0]);
+  } else if (pending && src.length) {
+    // Scroll by every row that arrived since the last paint, newest on top.
+    const n = Math.min(H, pending, src.length);
+    buf.copyWithin(W * n, 0, W * (H - n));
+    for (let y = 0; y < n; y++) paintRow(buf, y, W, src[y]);
     wctx.putImageData(wfImg, 0, 0);
   }
-  needFull = false; newRow = false;
+  needFull = false; pending = 0;
+  // While the range is automatic, the sliders show what the rows are painted with.
+  if (src[0] && S.levels?.auto && !$('sheet-set').hidden && !levelsBusy()) showLevels(src[0].lo, src[0].hi, true);
   drawSpectrum(src[0], detail);
+  drawBand();
   const line = $('tuneline'), lx = hzToX(tunedHz(), display.clientWidth);
-  line.hidden = lx < 0 || lx > display.clientWidth;
+  line.hidden = sweepOn() || lx < 0 || lx > display.clientWidth;
   line.style.left = lx + 'px';
   const tag = $('zoomtag');
-  tag.textContent = (detail ? 'detail · ' : '') + fmtHz(view.span) + 'Hz';
+  tag.textContent = (sweepOn() ? 'sweep · ' : detail ? 'detail · ' : '') + fmtHz(view.span) + 'Hz';
   tag.className = 'zoomtag' + (detail ? ' detail' : '');
 }
 
@@ -591,27 +760,33 @@ function drawSpectrum(r, detail) {
   g.addColorStop(0, '#0b1016'); g.addColorStop(1, '#040507');
   sctx.fillStyle = g; sctx.fillRect(0, 0, W, H);
 
-  // Frequency grid and labels.
+  // Frequency grid (the labels live on the band strip below).
   const step = niceStep(view.span, Math.max(3, Math.round(W / dpr / 90)));
-  const digits = Math.max(0, Math.min(6, Math.ceil(-Math.log10(step / 1e6))));
-  sctx.font = `${10 * dpr}px ui-monospace, Menlo, monospace`;
-  sctx.textAlign = 'center';
   for (let f = Math.ceil((view.center - view.span / 2) / step) * step; f <= view.center + view.span / 2; f += step) {
     const x = hzToX(f, W);
-    sctx.fillStyle = '#18202a'; sctx.fillRect(x, 0, dpr, H - 14 * dpr);
-    sctx.fillStyle = '#5d6b79'; sctx.fillText(fmtMHz(f, digits), x, H - 3 * dpr);
+    sctx.fillStyle = '#18202a'; sctx.fillRect(x, 0, dpr, H);
   }
 
   // Passband and tuned frequency.
   const [lo, hi] = passband();
   const x0 = hzToX(lo, W), x1 = hzToX(hi, W), xt = hzToX(tunedHz(), W);
   sctx.fillStyle = 'rgba(255,181,71,0.16)';
-  sctx.fillRect(x0, 0, Math.max(dpr, x1 - x0), H - 14 * dpr);
-  sctx.fillStyle = '#ffb547'; sctx.fillRect(xt - dpr / 2, 0, dpr, H - 14 * dpr);
+  sctx.fillRect(x0, 0, Math.max(dpr, x1 - x0), H);
+  sctx.fillStyle = '#ffb547'; sctx.fillRect(xt - dpr / 2, 0, dpr, H);
 
-  // Spectrum trace.
+  // Spectrum trace, with dB gridlines so the vertical range is readable.
   if (r) {
-    const top = 22 * dpr, bottom = H - 16 * dpr, h = bottom - top;
+    const top = 22 * dpr, bottom = H - 6 * dpr, h = bottom - top;
+    if (r.hi > r.lo) {
+      sctx.font = `${9 * dpr}px Menlo, monospace`;
+      sctx.textAlign = 'right';
+      for (const frac of [0.25, 0.5, 0.75]) {
+        const y = bottom - frac * h;
+        sctx.fillStyle = '#10161d'; sctx.fillRect(0, y, W, dpr);
+        sctx.fillStyle = '#4d5a68';
+        sctx.fillText((r.lo + frac * (r.hi - r.lo)).toFixed(0) + ' dB', W - 4 * dpr, y - 2 * dpr);
+      }
+    }
     const start = r.center - r.span / 2, perHz = r.bins / r.span;
     const cols = Math.round(W / dpr);
     sctx.beginPath();
@@ -652,6 +827,23 @@ function drawSpectrum(r, detail) {
 }
 let bookmarkHits = [];
 
+/** The frequency scale strip between the spectrum and the waterfall. */
+function drawBand() {
+  const W = band.width, H = band.height, dpr = window.devicePixelRatio || 1;
+  if (!W || !H) return;
+  bctx.fillStyle = '#040507'; bctx.fillRect(0, 0, W, H);
+  const step = niceStep(view.span, Math.max(3, Math.round(W / dpr / 90)));
+  const digits = Math.max(0, Math.min(6, Math.ceil(-Math.log10(step / 1e6))));
+  bctx.font = `${10 * dpr}px Menlo, monospace`;
+  bctx.textAlign = 'center';
+  bctx.fillStyle = '#8fa0b0';
+  for (let f = Math.ceil((view.center - view.span / 2) / step) * step; f <= view.center + view.span / 2; f += step) {
+    const x = hzToX(f, W);
+    bctx.fillRect(x, 0, dpr, 4 * dpr);
+    bctx.fillText(fmtMHz(f, digits), x, H - 3 * dpr);
+  }
+}
+
 // ── gestures on the display ─────────────────────────────────────────
 const display = $('display');
 const pointers = new Map();
@@ -686,7 +878,7 @@ display.addEventListener('pointerdown', (e) => {
   const rect = display.getBoundingClientRect();
   if (pointers.size === 1) {
     const lineX = hzToX(tunedHz(), rect.width), x = e.clientX - rect.left;
-    if (Math.abs(x - lineX) <= GRAB_PX) {
+    if (!sweepOn() && Math.abs(x - lineX) <= GRAB_PX) {
       // Grabbed the tuning line: drag it to tune, keeping the finger's offset from the line.
       clearTimeout(dragClear);
       gesture = { type: 'tune', grab: x - lineX, rect };
@@ -724,6 +916,7 @@ display.addEventListener('pointermove', (e) => {
   } else if (gesture.type === 'pan') {
     view.center = gesture.center0 - ((e.clientX - gesture.x0) / W) * view.span;
     clampView(); dirty(true);
+    if (sweepOn()) sendSweepView();
   } else if (gesture.type === 'pinch' && pointers.size >= 2) {
     const [a, b] = [...pointers.values()];
     const d = Math.max(10, Math.abs(a.x - b.x)), mid = (a.x + b.x) / 2 - gesture.rect.left;
@@ -732,6 +925,7 @@ display.addEventListener('pointermove', (e) => {
     // Keep the frequency between the fingers under them.
     view.center = gesture.fmid - (mid / W - 0.5) * view.span;
     clampView(); dirty(true);
+    if (sweepOn()) sendSweepView();
   }
 });
 function endPointer(e) {
@@ -757,6 +951,7 @@ display.addEventListener('wheel', (e) => {
   clampView();
   view.center = f - (x / rect.width - 0.5) * view.span;
   clampView(); dirty(true);
+  if (sweepOn()) sendSweepView();
 }, { passive: false });
 
 function onTap(x, y, W) {
@@ -765,13 +960,16 @@ function onTap(x, y, W) {
     // Double tap: zoom in around the tap, or back out to the whole band.
     clearTimeout(tapTimer); lastTap = null;
     const f = xToHz(x, W);
-    view.span = view.span < S.rate * 0.99 ? S.rate : view.span / 6;
+    const maxSpan = sweepOn() ? S.freq_max_hz - S.freq_min_hz : S.rate;
+    view.span = view.span < maxSpan * 0.99 ? maxSpan : view.span / 6;
     clampView();
     view.center = f - (x / W - 0.5) * view.span;
     clampView(); dirty(true);
+    if (sweepOn()) sendSweepView();
     return;
   }
   lastTap = { t: now, x };
+  if (sweepOn()) return;   // no tuning while sweeping
   // A tap on a bookmark flag goes to the bookmark.
   const flag = y < 26 ? bookmarkHits.find((h) => Math.abs(h.x - x) < 14) : null;
   const hz = snap(xToHz(x, W));
@@ -929,6 +1127,37 @@ $('gain').addEventListener('input', (e) => { if (S) $('gainlbl').textContent = S
 $('gain').addEventListener('change', (e) => { if (S) send({ cmd: 'gain', db: S.gains[+e.target.value] }); });
 $('bw').addEventListener('input', (e) => { $('bwlbl').textContent = fmtHz(sliderToBw(+e.target.value)) + 'Hz'; });
 $('bw').addEventListener('change', (e) => send({ cmd: 'bandwidth', hz: sliderToBw(+e.target.value) }));
+// Scope range: two sliders set the floor and ceiling; "Re-scan" re-arms auto.
+// The ceiling is kept at least MIN_RANGE above the floor (the server rejects less):
+// moving one slider past the other pushes the other along.
+const MIN_RANGE = 5;
+let lvlTimer = null, lvlTouched = 0;
+/** True while a slider is being moved or a change is still on its way to the server,
+ *  so a state message from before the change cannot snap the sliders back. */
+function levelsBusy() {
+  return $('scopelo').matches(':active') || $('scopehi').matches(':active') || performance.now() - lvlTouched < 800;
+}
+function showLevels(lo, hi, auto) {
+  $('scopelo').value = Math.round(lo); $('scopehi').value = Math.round(hi);
+  $('floorlbl').textContent = Math.round(lo) + ' dBFS';
+  $('ceillbl').textContent = Math.round(hi) + ' dBFS';
+  $('rangelbl').textContent = auto ? 'auto' : Math.round(hi - lo) + ' dB';
+}
+function onLevelInput(e) {
+  let lo = +$('scopelo').value, hi = +$('scopehi').value;
+  if (hi - lo < MIN_RANGE) {
+    if (e.target.id === 'scopelo') hi = Math.min(+$('scopehi').max, lo + MIN_RANGE);
+    else lo = Math.max(+$('scopelo').min, hi - MIN_RANGE);
+    lo = Math.min(lo, hi - MIN_RANGE);
+  }
+  showLevels(lo, hi, false);
+  lvlTouched = performance.now();
+  clearTimeout(lvlTimer);
+  lvlTimer = setTimeout(() => send({ cmd: 'levels', lo, hi }), 120);
+}
+$('scopelo').addEventListener('input', onLevelInput);
+$('scopehi').addEventListener('input', onLevelInput);
+$('lvlauto').onclick = () => { lvlTouched = 0; send({ cmd: 'levels', auto: true }); };
 $('volume').value = prefs.volume;
 $('vollbl').textContent = Math.round(prefs.volume * 100) + ' %';
 $('volume').addEventListener('input', (e) => {
@@ -946,10 +1175,28 @@ $('bg').onclick = () => {
   prefs.bg = !prefs.bg; savePrefs(); setToggle('bg', prefs.bg);
   if (playing) route();
 };
+$('sweepbtn').onclick = toggleSweep;
+$('swgo').onclick = sweepGo;
+for (const id of ['swstart', 'swend']) {
+  $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sweepGo(); } });
+}
 
 // ── audio ───────────────────────────────────────────────────────────
 let ctx = null, gain = null, streamDest = null, next = 0, playing = false, wakeLock = null;
+let opus = null, opusInit = null, expect = {};   // expect[kind] = last packet sequence
 const bgAudio = $('bgAudio');
+
+// The WASM libopus decoder (assets/opus-decoder.min.js, served at /opus-decoder.js).
+function initOpus() {
+  if (!opusInit) opusInit = (async () => {
+    const D = window['opus-decoder'] && window['opus-decoder'].OpusDecoder;
+    if (!D) throw new Error('decoder script missing');
+    const d = new D({ sampleRate: OPUS_RATE, channels: 1 });
+    await d.ready;
+    return d;
+  })();
+  return opusInit;
+}
 
 // iOS mutes Web Audio with the silent switch unless the page also plays an HTML media
 // element. A looping silent clip, started from the Play tap, keeps it in "playback" mode
@@ -986,23 +1233,25 @@ function route() {
   }
 }
 
+// One Opus packet (opus.rs): kind, seq u32, cur len u16, prev len u16, cur, prev (FEC).
 function onAudio(b) {
-  if (!ctx || !playing) return;
+  if (!ctx || !playing || !opus) return;
   if (ctx.state !== 'running') ctx.resume().catch(() => {});
-  let ab;
-  if (b[0] === 4) {
-    // Full quality: rate u32, then 16-bit PCM (48 kHz for broadcast FM).
-    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
-    const n = (b.length - 5) >> 1;
-    ab = ctx.createBuffer(1, n, dv.getUint32(1, true));
-    const ch = ab.getChannelData(0);
-    for (let i = 0; i < n; i++) ch[i] = dv.getInt16(5 + 2 * i, true) / 32768;
-  } else {
-    // Low data: IMA ADPCM at RATE.
-    const n = (b.length - 4) * 2;
-    ab = ctx.createBuffer(1, n, RATE);
-    adpcm(b, 1, n, ab.getChannelData(0), 1 / 32768);
-  }
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const seq = dv.getUint32(1, true), curLen = dv.getUint16(5, true), prevLen = dv.getUint16(7, true);
+  const cur = b.subarray(9, 9 + curLen), prev = prevLen ? b.subarray(9 + curLen, 9 + curLen + prevLen) : null;
+  const last = expect[b[0]];
+  if (last !== undefined && seq <= last) return;                       // stale or duplicate
+  if (prev && last !== undefined && seq === last + 2) play(opus.decodeFrame(prev)); // FEC: fills the one gap
+  expect[b[0]] = seq;
+  play(opus.decodeFrame(cur));
+}
+
+function play(decoded) {
+  const data = decoded.channelData && decoded.channelData[0];
+  if (!data || !data.length) return;
+  const ab = ctx.createBuffer(1, data.length, OPUS_RATE);
+  ab.getChannelData(0).set(data);
   const now = ctx.currentTime;
   if (next < now + 0.02) next = now + LEAD;     // after a gap, rebuild a small buffer
   if (next > now + MAX_LAG) return;             // running ahead: drop to keep latency down
@@ -1026,9 +1275,14 @@ async function start() {
   const resumed = ctx.resume();
   playing = true;
   next = 0;
+  expect = {};
   $('play').textContent = '■ Stop'; $('play').className = 'btn play stop';
   setMediaState();
   await resumed.catch(() => {});
+  if (!opus) {
+    try { opus = await initOpus(); }
+    catch (e) { toast('Opus decoder failed to load: ' + e); }
+  }
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
 }
 
@@ -1077,7 +1331,9 @@ function toast(msg) {
 }
 
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && playing) {
+  if (document.visibilityState !== 'visible') return;
+  dirty(true);   // rows piled up while hidden; repaint now, not at the next interaction
+  if (playing) {
     if (ctx) await ctx.resume().catch(() => {});
     try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
   }
@@ -1085,6 +1341,10 @@ document.addEventListener('visibilitychange', async () => {
 window.addEventListener('resize', resize);
 resize();
 connect();
+// Safari and Firefox can starve requestAnimationFrame on an idle page; this heartbeat
+// paints pending rows even when no frame is ever scheduled, so the waterfall moves
+// without needing a scroll or drag to wake the page up.
+setInterval(() => { if (needFull || pending) draw(); }, 250);
 </script>
 </body>
 </html>

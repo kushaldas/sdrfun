@@ -16,7 +16,7 @@ use crate::channel::{Channel, Frame, Mode};
 use crate::clean::{CleanChain, CleanConfig, FRAME, SAMPLE_RATE};
 use crate::gate::{Gate, GateConfig, GateEvent, Transmission, Verdict};
 use crate::recorder::{StreamWriter, TransmissionLog, recording_path};
-use crate::sdr::{Block, Device, Gain};
+use crate::sdr::{Block, Device, Gain, SdrSelect};
 use crate::serve::Streamer;
 
 /// Frames between status-line refreshes (0.5 s).
@@ -27,6 +27,9 @@ pub struct ListenArgs {
     /// Frequency to listen on, MHz
     #[arg(default_value_t = 120.150)]
     pub freq: f64,
+    /// Radio to use: rtlsdr, hackrf or both (first one attached wins; env SDRFUN_SDR)
+    #[arg(long, value_enum, ignore_case = true, env = "SDRFUN_SDR")]
+    pub sdr: Option<SdrSelect>,
     /// RTL-SDR device index
     #[arg(long, default_value_t = 0)]
     pub device: u32,
@@ -84,7 +87,8 @@ pub fn run(args: ListenArgs) -> Result<()> {
     let target_hz = args.freq * 1e6;
     let wanted_center = (target_hz + args.offset_khz * 1e3).round() as u32;
 
-    let mut dev = Device::open(args.device)?;
+    let kind = crate::sdr::selected(SdrSelect::resolve(args.sdr))?[0];
+    let mut dev = Device::open(kind, args.device)?;
     let rate = dev.set_sample_rate(args.sample_rate)?;
     dev.set_ppm(args.ppm)?;
     let gain = dev.set_gain(args.gain)?;

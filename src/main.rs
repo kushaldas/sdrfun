@@ -6,12 +6,14 @@ mod clean;
 mod dsp;
 mod gate;
 mod listen;
+mod opus;
 mod recorder;
 mod scan;
 mod sdr;
 mod spectrum;
 mod serve;
 mod squelch;
+mod sweep;
 #[cfg(test)]
 mod testsig;
 mod wavio;
@@ -61,7 +63,7 @@ enum Command {
     },
     /// Interactive receiver for phones: waterfall, tuning, modes and bookmarks in a web page
     Web(web::WebArgs),
-    /// List RTL-SDR devices and audio outputs
+    /// List attached radios (RTL-SDR, HackRF) and audio outputs
     Devices,
 }
 
@@ -87,14 +89,19 @@ fn main() -> Result<()> {
         }
         Command::Devices => {
             let devices = sdr::list_devices();
-            println!("RTL-SDR devices (--device):");
+            println!("radios (--device indexes within a kind, --sdr picks the kind):");
             if devices.is_empty() {
                 println!("  none found");
             }
             for d in devices {
                 println!(
-                    "  {}: {} — {} {} (serial {})",
-                    d.index, d.name, d.manufacturer, d.product, d.serial
+                    "  {} #{}: {} — {} {} (serial {})",
+                    d.kind.name(),
+                    d.index,
+                    d.name,
+                    d.manufacturer,
+                    d.product,
+                    d.serial
                 );
             }
             println!("audio outputs (--audio-device):");

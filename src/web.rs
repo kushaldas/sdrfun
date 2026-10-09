@@ -6,17 +6,20 @@
 //! WebSocket messages, server → client (see also `serve.rs`):
 //! - text JSON: `state` (full receiver state after every change), `bookmarks`, `meter`
 //!   (level, floor, squelch open, ADC clipping; 10 a second) and `error`.
-//! - binary, first byte = type: `4` audio, full quality (rate u32 LE, then mono s16le PCM;
-//!   48 kHz for WFM, `STREAM_RATE` otherwise); `1` the same audio for low-data clients
-//!   (IMA ADPCM chunk of `STREAM_RATE` mono, see `adpcm.rs`); each client gets one of the
-//!   two. `2` wideband and `3` detail waterfall row: `ROW_HEADER` bytes (centre Hz
-//!   u32, span Hz u32, lo dB f32, hi dB f32, bins u16, all LE) then an ADPCM chunk of
-//!   `bins` levels (0..255 scaled by `ROW_SCALE`).
+//! - binary, first byte = type: `4` audio, full quality, and `1` the same audio at a
+//!   low bitrate for low-data clients — both 48 kHz mono Opus in 20 ms packets with a
+//!   copy of the previous packet for forward error correction (framing in `opus.rs`);
+//!   each client gets one of the two. `2` wideband, `3` detail waterfall row and `6`
+//!   sweep row (sweep mode, see `sweep.rs`): `ROW_HEADER` bytes (centre Hz u32, span Hz
+//!   u32, lo dB f32, hi dB f32, bins u16, all LE) then an ADPCM chunk of `bins` levels
+//!   (0..255 scaled by `ROW_SCALE`).
 //!
 //! Client → server: JSON with `cmd` = `tune` {hz, mode?, bandwidth?, squelch?}, `mode`
 //! {mode}, `bandwidth` {hz}, `squelch` {db | null}, `cleanup` {on}, `gain` {db | "auto"},
-//! `span` {rate}, `bookmark_add` {name, hz, mode, bandwidth?, squelch?}, `bookmark_del`
-//! {id}, and `lowdata` {on} (handled per client in `serve.rs`).
+//! `span` {rate}, `fft` {size} (bins per waterfall row, a power of two up to `--fft-max`),
+//! `sdr` {which} (rtlsdr | hackrf), `sweep` {on, start?, end?} (Hz; off
+//! needs no start/end), `bookmark_add` {name, hz, mode, bandwidth?, squelch?},
+//! `bookmark_del` {id}, and `lowdata` {on} (handled per client in `serve.rs`).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -35,20 +38,21 @@ use crate::adpcm;
 use crate::audio_out::AudioOut;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::channel::{Channel, Frame, Mode, WFM_DEEMPHASIS_US};
-use crate::clean::{BasicChain, CleanChain, CleanConfig, FRAME, SAMPLE_RATE};
-use crate::dsp::resample::Resampler;
+use crate::clean::{BasicChain, CleanChain, CleanConfig, FRAME};
 use crate::gate::DEFAULT_PRE_ROLL_S;
 use crate::scan::{DC_GUARD_HZ, USABLE_FRACTION};
-use crate::sdr::{Block, Control, Device, Gain};
-use crate::serve::{AUDIO_FULL, AUDIO_LOW, CHUNK, Hub, STREAM_RATE, to_i16};
+use crate::sdr::{Block, Capture, Control, Device, Gain, Rig, SdrKind, SdrSelect, pump};
+use crate::serve::{AUDIO_FULL, AUDIO_LOW, Hub};
 use crate::spectrum::{Levels, Spectrum};
 use crate::squelch::Squelch;
 
 const PAGE: &str = include_str!("web.html");
 /// IQ rates offered as the waterfall span; all are multiples of 240 kHz (WFM) and 48 kHz.
 pub const SPANS: [u32; 4] = [2_400_000, 1_920_000, 1_200_000, 960_000];
-const WIDE_BINS: usize = 2048;
-const DETAIL_BINS: usize = 1024;
+/// Smallest FFT size offered on the page; rows are never narrower.
+pub const FFT_MIN: usize = 512;
+/// Largest FFT size `--fft-max` accepts: the row header counts bins in a u16.
+pub const FFT_LIMIT: usize = 32768;
 const ROWS_PER_S: u32 = 10;
 /// Frames between meter messages (100 ms).
 const METER_FRAMES: usize = 10;
@@ -61,16 +65,16 @@ const PRE_ROLL_FRAMES: usize = (DEFAULT_PRE_ROLL_S * 100.0) as usize;
 const RELEARN_FRAMES: u32 = 20;
 /// Waterfall levels are sent as ADPCM samples of `level * ROW_SCALE`.
 pub const ROW_SCALE: i16 = 64;
-/// Tunable range: HF needs the V4's upconverter (handled by its driver), the R828D
-/// tuner tops out at 1766 MHz.
-const MIN_HZ: f64 = 100e3;
-const MAX_HZ: f64 = 1766e6;
 /// Agc for the basic (no cleanup) chain.
 const AGC_TARGET_DBFS: f32 = -20.0;
 const AGC_MAX_GAIN_DB: f32 = 40.0;
 
 #[derive(Args, Debug)]
 pub struct WebArgs {
+    /// Radio to use: rtlsdr, hackrf or both (default: whatever is attached).
+    /// The environment variable SDRFUN_SDR does the same; the flag wins.
+    #[arg(long, value_enum, ignore_case = true, env = "SDRFUN_SDR")]
+    pub sdr: Option<SdrSelect>,
     /// Frequency to start on, MHz
     #[arg(default_value_t = 145.500)]
     pub freq: f64,
@@ -89,6 +93,14 @@ pub struct WebArgs {
     /// IQ sample rate (= waterfall span), a multiple of 240000 (changeable from the page)
     #[arg(long, default_value_t = 2_400_000)]
     pub sample_rate: u32,
+    /// FFT size to start with: bins per waterfall and spectrum row, a power of two
+    /// (changeable from the page, up to --fft-max)
+    #[arg(long, env = "SDRFUN_FFT", default_value_t = 2048, value_parser = parse_fft)]
+    pub fft: usize,
+    /// Largest FFT size the page may pick (a power of two, 512–32768). Bigger sizes show
+    /// finer detail but cost the Pi more CPU and every client more data.
+    #[arg(long, env = "SDRFUN_FFT_MAX", default_value_t = 8192, value_parser = parse_fft)]
+    pub fft_max: usize,
     /// Address to serve the page on
     #[arg(long, value_name = "ADDR", default_value = "0.0.0.0:8010")]
     pub serve: String,
@@ -109,6 +121,27 @@ pub struct WebArgs {
     pub volume: f32,
     #[command(flatten)]
     pub clean: CleanConfig,
+}
+
+fn parse_fft(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("expected a number, got {s:?}"))?;
+    if !n.is_power_of_two() || !(FFT_MIN..=FFT_LIMIT).contains(&n) {
+        return Err(format!("FFT size must be a power of two from {FFT_MIN} to {FFT_LIMIT}, got {n}"));
+    }
+    Ok(n)
+}
+
+/// FFT sizes the page offers: powers of two from `FFT_MIN` up to `max`.
+pub fn fft_sizes(max: usize) -> Vec<usize> {
+    std::iter::successors(Some(FFT_MIN), |&n| Some(n * 2)).take_while(|&n| n <= max).collect()
+}
+
+/// Bins for the detail (channel) rows: the FFT size, but small enough that one FFT of the
+/// channel-rate IQ fits in a row interval, so rows keep coming 10 times a second.
+fn detail_bins(fft: usize, tap_rate: u32) -> usize {
+    let per_row = (tap_rate / ROWS_PER_S) as usize;
+    let fits = if per_row.is_power_of_two() { per_row } else { per_row.next_power_of_two() / 2 };
+    fft.min(fits).max(64)
 }
 
 /// Tuner centre for listening on `hz`, or `None` if the current `center` already works:
@@ -140,6 +173,16 @@ pub struct Output {
 /// The receiver behind the page: owns the DSP and the settings clients can change.
 pub struct Radio {
     rate: u32,
+    /// The active radio and the ones attached (switchable from the page).
+    sdr: SdrKind,
+    sdrs: Vec<SdrKind>,
+    /// Active spectrum sweep range, Hz.
+    sweep: Option<(f64, f64)>,
+    /// Waterfall dB range; None follows the signals automatically until settled.
+    levels: Option<(f32, f32)>,
+    /// FFT size: bins per wideband row (a power of two), and the most `--fft-max` allows.
+    fft: usize,
+    fft_max: usize,
     /// Where the tuner is, or was last asked to go.
     center_hz: f64,
     tuned_hz: f64,
@@ -178,6 +221,7 @@ pub struct Radio {
 }
 
 impl Radio {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rate: u32,
         tuned_hz: f64,
@@ -186,6 +230,9 @@ impl Radio {
         gains: Vec<f32>,
         deemphasis: f32,
         clean_cfg: CleanConfig,
+        sdrs: Vec<SdrKind>,
+        fft: usize,
+        fft_max: usize,
     ) -> Result<Self> {
         if !rate.is_multiple_of(Mode::Wfm.demod_rate()) {
             bail!("sample rate {rate} must be a multiple of {}", Mode::Wfm.demod_rate());
@@ -193,8 +240,15 @@ impl Radio {
         let bandwidth = mode.default_bandwidth();
         let center_hz = plan_center(tuned_hz, tuned_hz, rate, bandwidth).unwrap_or(tuned_hz);
         let channel = build_channel(rate, center_hz, tuned_hz, mode, bandwidth, deemphasis)?;
+        let fft = fft.min(fft_max);
         Ok(Self {
             rate,
+            sdr: sdrs[0],
+            sdrs,
+            sweep: None,
+            levels: None,
+            fft,
+            fft_max,
             center_hz,
             tuned_hz,
             mode,
@@ -208,10 +262,10 @@ impl Radio {
             channel_at: (center_hz as u32, rate),
             basic: basic_chain(mode),
             squelch: Squelch::new(mode.default_squelch()),
-            wide: Spectrum::new(WIDE_BINS, rate, ROWS_PER_S),
+            wide: Spectrum::new(fft, rate, ROWS_PER_S),
             wide_levels: Levels::default(),
             wide_enc: adpcm::Encoder::default(),
-            detail: Spectrum::new(DETAIL_BINS, mode.demod_rate(), ROWS_PER_S),
+            detail: Spectrum::new(detail_bins(fft, mode.demod_rate()), mode.demod_rate(), ROWS_PER_S),
             detail_levels: Levels::default(),
             detail_enc: adpcm::Encoder::default(),
             tap: Vec::new(),
@@ -225,14 +279,18 @@ impl Radio {
         })
     }
 
-    /// Sample rate of the full-quality audio stream: broadcast FM keeps its 15 kHz audio,
-    /// voice needs less.
-    pub fn audio_rate(&self) -> u32 {
-        if self.mode == Mode::Wfm { SAMPLE_RATE } else { STREAM_RATE }
+    /// Bins per waterfall row.
+    pub fn fft(&self) -> usize {
+        self.fft
     }
 
     pub fn center_hz(&self) -> u32 {
         self.center_hz as u32
+    }
+
+    /// Frequencies the active radio can reach.
+    pub fn freq_range(&self) -> (f64, f64) {
+        self.sdr.freq_range()
     }
 
     /// Apply a client command; returns the tuner changes it needs.
@@ -273,6 +331,77 @@ impl Radio {
                 self.cleanup = cmd["on"].as_bool().ok_or_else(|| anyhow!("cleanup needs on"))?;
                 Ok(Vec::new())
             }
+            "sdr" => {
+                let which = cmd["which"].as_str().unwrap_or_default();
+                let kind = SdrKind::from_name(which).ok_or_else(|| anyhow!("unknown radio {which:?}"))?;
+                if !self.sdrs.contains(&kind) {
+                    bail!("no {which} attached");
+                }
+                if kind == self.sdr {
+                    return Ok(Vec::new());
+                }
+                self.sdr = kind;
+                let mut controls = vec![Control::Switch(kind)];
+                // The new radio may not reach the current frequency.
+                let (lo, hi) = self.freq_range();
+                let hz = self.tuned_hz.clamp(lo, hi);
+                controls.extend(self.tune(hz)?);
+                Ok(controls)
+            }
+            "sweep" => {
+                if !cmd["on"].as_bool().unwrap_or(false) {
+                    self.sweep = None;
+                    return Ok(vec![Control::Sweep(None)]);
+                }
+                let start = cmd["start"].as_f64().ok_or_else(|| anyhow!("sweep needs start"))?;
+                let end = cmd["end"].as_f64().ok_or_else(|| anyhow!("sweep needs end"))?;
+                let (lo, hi) = self.freq_range();
+                if !(lo..=hi).contains(&start) || !(lo..=hi).contains(&end) || end <= start {
+                    bail!(
+                        "sweep must be within {}–{} MHz with end > start",
+                        lo / 1e6,
+                        hi / 1e6
+                    );
+                }
+                self.sweep = Some((start, end));
+                Ok(vec![Control::Sweep(Some((start as u32, end as u32)))])
+            }
+            "levels" => {
+                if cmd["auto"].as_bool().unwrap_or(false) {
+                    self.levels = None;
+                    self.wide_levels.rearm();
+                    self.detail_levels.rearm();
+                    return Ok(vec![Control::Levels(None)]);
+                }
+                let lo = cmd["lo"].as_f64().ok_or_else(|| anyhow!("levels needs lo and hi"))? as f32;
+                let hi = cmd["hi"].as_f64().ok_or_else(|| anyhow!("levels needs lo and hi"))? as f32;
+                if !(hi > lo) {
+                    bail!("ceiling must be above floor");
+                }
+                self.levels = Some((lo, hi));
+                self.wide_levels.set_manual(lo, hi);
+                self.detail_levels.set_manual(lo, hi);
+                Ok(vec![Control::Levels(self.levels)])
+            }
+            "fft" => {
+                let size = cmd["size"].as_u64().unwrap_or_default() as usize;
+                if !fft_sizes(self.fft_max).contains(&size) {
+                    bail!("FFT size must be one of {:?}", fft_sizes(self.fft_max));
+                }
+                if size == self.fft {
+                    return Ok(Vec::new());
+                }
+                self.fft = size;
+                self.wide = Spectrum::new(size, self.channel_at.1, ROWS_PER_S);
+                self.detail = Spectrum::new(detail_bins(size, self.mode.demod_rate()), self.mode.demod_rate(), ROWS_PER_S);
+                // The noise floor per bin drops 3 dB with every doubling: an automatic
+                // range has to find it again (a range the user set stays).
+                if self.levels.is_none() {
+                    self.wide_levels.rearm();
+                    self.detail_levels.rearm();
+                }
+                Ok(vec![Control::Bins(size)])
+            }
             "gain" => {
                 self.gain = match &cmd["db"] {
                     Value::String(s) => s.parse().map_err(|e: String| anyhow!(e))?,
@@ -285,13 +414,15 @@ impl Radio {
             }
             "span" => {
                 let rate = cmd["rate"].as_u64().unwrap_or_default() as u32;
-                if !SPANS.contains(&rate) {
-                    bail!("span must be one of {SPANS:?}");
+                if !self.spans().contains(&rate) {
+                    bail!("span must be one of {:?}", self.spans());
                 }
                 if rate == self.rate {
                     return Ok(Vec::new());
                 }
                 self.rate = rate;
+                self.wide_levels.rearm();
+                self.detail_levels.rearm();
                 // The channel is rebuilt when blocks at the new rate arrive.
                 let mut controls = vec![Control::Rate(rate)];
                 if let Some(c) = plan_center(self.tuned_hz, self.center_hz, rate, self.bandwidth) {
@@ -314,8 +445,9 @@ impl Radio {
         self.cleanup = mode.default_cleanup();
         self.squelch.threshold = mode.default_squelch();
         self.basic = basic_chain(mode);
-        self.detail = Spectrum::new(DETAIL_BINS, mode.demod_rate(), ROWS_PER_S);
-        self.detail_levels = Levels::default();
+        self.detail = Spectrum::new(detail_bins(self.fft, mode.demod_rate()), mode.demod_rate(), ROWS_PER_S);
+        self.detail_levels.rearm();
+        self.wide_levels.rearm();
         self.rebuild(old_bw)
     }
 
@@ -348,8 +480,15 @@ impl Radio {
     }
 
     fn tune(&mut self, hz: f64) -> Result<Vec<Control>> {
-        if !(MIN_HZ..=MAX_HZ).contains(&hz) {
-            bail!("{:.3} MHz is outside {}–{} MHz", hz / 1e6, MIN_HZ / 1e6, MAX_HZ / 1e6);
+        let (min_hz, max_hz) = self.freq_range();
+        if !(min_hz..=max_hz).contains(&hz) {
+            bail!(
+                "{:.3} MHz is outside {}–{} MHz for {}",
+                hz / 1e6,
+                min_hz / 1e6,
+                max_hz / 1e6,
+                self.sdr.name()
+            );
         }
         self.tuned_hz = hz;
         let mut controls = Vec::new();
@@ -378,7 +517,7 @@ impl Radio {
                     Ok(c) => self.channel = c,
                     Err(_) => return,
                 }
-                self.wide = Spectrum::new(WIDE_BINS, block.rate, ROWS_PER_S);
+                self.wide = Spectrum::new(self.fft, block.rate, ROWS_PER_S);
             } else if self.channel.set_offset(offset).is_err() {
                 return; // captured before the retune took effect
             }
@@ -395,7 +534,7 @@ impl Radio {
         self.rows.clear();
         self.wide.push_u8(&block.data, &mut self.rows);
         for row in self.rows.drain(..) {
-            let levels = self.wide_levels.quantize(&row);
+            let levels = self.wide_levels.quantize_dc(&row, Some((row.len() / 2, 4)));
             out.rows.push(row_message(2, block.center_hz, block.rate, &self.wide_levels, &levels, &mut self.wide_enc));
         }
 
@@ -406,7 +545,7 @@ impl Radio {
         self.tap.clear();
         let span = self.channel.tap_rate();
         for row in self.rows.drain(..) {
-            let levels = self.detail_levels.quantize(&row);
+            let levels = self.detail_levels.quantize_dc(&row, Some((row.len() / 2, 4)));
             out.rows.push(row_message(3, self.tuned_hz.round() as u32, span, &self.detail_levels, &levels, &mut self.detail_enc));
         }
 
@@ -457,6 +596,16 @@ impl Radio {
         }
     }
 
+    /// Spans the active radio can stream: the demod chain needs a multiple of the
+    /// WFM rate whose decimation splits into factors ≤ 10, so the HackRF tops out
+    /// at 19.2 MHz rather than its raw 20 MSPS.
+    pub fn spans(&self) -> Vec<u32> {
+        match self.sdr {
+            SdrKind::Hackrf => vec![19_200_000, 14_400_000, 9_600_000, 4_800_000, 2_400_000, 1_200_000],
+            SdrKind::Rtlsdr => SPANS.to_vec(),
+        }
+    }
+
     pub fn state_json(&self) -> Value {
         json!({
             "type": "state",
@@ -472,7 +621,23 @@ impl Radio {
             "cleanup": self.cleanup,
             "gain": match self.gain { Gain::Auto => Value::Null, Gain::Manual(db) => json!(db) },
             "gains": self.gains,
-            "spans": SPANS,
+            "spans": self.spans(),
+            "fft": self.fft,
+            "fft_sizes": fft_sizes(self.fft_max),
+            "sdr": self.sdr.name(),
+            "sdrs": self.sdrs.iter().map(|k| k.name()).collect::<Vec<_>>(),
+            "sweep": match self.sweep {
+                Some((a, b)) => json!({"start": a, "end": b}),
+                None => Value::Null,
+            },
+            "levels": json!({
+                "auto": self.wide_levels.auto,
+                "lo": self.wide_levels.lo,
+                "hi": self.wide_levels.hi,
+            }),
+            "detail_hz": self.channel.tap_rate(),
+            "freq_min_hz": self.freq_range().0,
+            "freq_max_hz": self.freq_range().1,
             "modes": Mode::ALL.iter().map(|m| json!({
                 "name": m.name(),
                 "bandwidth": m.default_bandwidth(),
@@ -527,82 +692,60 @@ fn row_message(kind: u8, center_hz: u32, span: u32, range: &Levels, levels: &[u8
     msg
 }
 
-/// 48 kHz audio → messages for the page, in 100 ms pieces: full-quality 16-bit PCM at the
-/// mode's rate (`AUDIO_FULL`: rate u32 LE, then s16le) and IMA ADPCM at `STREAM_RATE` for
-/// low-data clients (`AUDIO_LOW`). Each client gets one of the two (see `serve.rs`).
+/// 48 kHz audio → Opus messages for the page, in 20 ms packets each carrying a copy of
+/// the previous packet for forward error correction (see `opus.rs`): `AUDIO_FULL` at the
+/// mode's quality and `AUDIO_LOW` as a low-bitrate voice stream. Each client gets one of
+/// the two (see `serve.rs`).
 struct AudioStream {
-    low: Resampler,
-    low_scratch: Vec<f32>,
-    low_pending: Vec<i16>,
-    enc: adpcm::Encoder,
-    full_rate: u32,
-    full: Resampler,
-    full_scratch: Vec<f32>,
-    full_pending: Vec<i16>,
+    low: crate::opus::Stream,
+    full: crate::opus::Stream,
 }
 
 impl AudioStream {
-    fn new(full_rate: u32) -> Self {
-        Self {
-            low: Resampler::new(SAMPLE_RATE, STREAM_RATE),
-            low_scratch: Vec::new(),
-            low_pending: Vec::with_capacity(CHUNK),
-            enc: adpcm::Encoder::default(),
-            full_rate,
-            full: Resampler::new(SAMPLE_RATE, full_rate),
-            full_scratch: Vec::new(),
-            full_pending: Vec::new(),
-        }
+    fn new() -> Result<Self> {
+        Ok(Self {
+            low: crate::opus::Stream::new(AUDIO_LOW, 16, true)?,
+            full: crate::opus::Stream::new(AUDIO_FULL, 32, true)?,
+        })
     }
 
-    /// Switch the full-quality rate (when the mode changes).
-    fn set_full_rate(&mut self, rate: u32) {
-        if rate != self.full_rate {
-            self.full_rate = rate;
-            self.full = Resampler::new(SAMPLE_RATE, rate);
-            self.full_pending.clear();
-        }
+    /// Broadcast FM keeps its full 15 kHz audio at a higher bitrate; voice modes use the
+    /// VoIP profile.
+    fn set_mode(&mut self, mode: Mode) -> Result<()> {
+        let wfm = mode == Mode::Wfm;
+        self.full.set_profile(if wfm { 64 } else { 32 }, !wfm)
     }
 
     fn push(&mut self, audio: &[f32], out: &mut Vec<Vec<u8>>) {
-        self.low_scratch.clear();
-        self.low.process(audio, &mut self.low_scratch);
-        for &s in &self.low_scratch {
-            self.low_pending.push(to_i16(s));
-            if self.low_pending.len() == CHUNK {
-                let mut msg = vec![AUDIO_LOW];
-                msg.extend(self.enc.encode(&self.low_pending));
-                out.push(msg);
-                self.low_pending.clear();
-            }
-        }
-
-        let chunk = self.full_rate as usize / 10;
-        self.full_scratch.clear();
-        self.full.process(audio, &mut self.full_scratch);
-        for &s in &self.full_scratch {
-            self.full_pending.push(to_i16(s));
-            if self.full_pending.len() == chunk {
-                let mut msg = Vec::with_capacity(5 + 2 * chunk);
-                msg.push(AUDIO_FULL);
-                msg.extend_from_slice(&self.full_rate.to_le_bytes());
-                msg.extend(self.full_pending.iter().flat_map(|v| v.to_le_bytes()));
-                out.push(msg);
-                self.full_pending.clear();
-            }
-        }
+        self.low.push(audio, out);
+        self.full.push(audio, out);
     }
 }
 
 pub fn run(args: WebArgs) -> Result<()> {
-    let mut dev = Device::open(args.device)?;
-    let rate = dev.set_sample_rate(args.sample_rate)?;
-    dev.set_ppm(args.ppm)?;
-    let gain_db = dev.set_gain(args.gain)?;
-    let gains: Vec<f32> = dev.gains().iter().map(|&g| g as f32 / 10.0).collect();
+    let kinds = crate::sdr::selected(SdrSelect::resolve(args.sdr))?;
+    let mut sources = Vec::new();
+    for kind in &kinds {
+        sources.push(Device::open(*kind, args.device)?);
+    }
+    let rate = sources[0].set_sample_rate(args.sample_rate)?;
+    sources[0].set_ppm(args.ppm)?;
+    let gain_db = sources[0].set_gain(args.gain)?;
+    let gains: Vec<f32> = sources[0].gains_db();
     let gain = gain_db.map_or(Gain::Auto, Gain::Manual);
-    let mut radio = Radio::new(rate, args.freq * 1e6, args.mode, gain, gains, args.deemphasis, args.clean.clone())?;
-    dev.set_center_freq(radio.center_hz())?;
+    let mut radio = Radio::new(
+        rate,
+        args.freq * 1e6,
+        args.mode,
+        gain,
+        gains,
+        args.deemphasis,
+        args.clean.clone(),
+        kinds.clone(),
+        args.fft,
+        args.fft_max,
+    )?;
+    sources[0].set_center_freq(radio.center_hz())?;
     let mut bookmarks = Bookmarks::open(&args.bookmarks)?;
 
     let (cmd_tx, cmd_rx) = channel::<Value>();
@@ -610,10 +753,13 @@ pub fn run(args: WebArgs) -> Result<()> {
     hub.latest("state", radio.state_json());
     hub.latest("bookmarks", bookmarks.json());
     eprintln!(
-        "receiver on {url} ({:.4} MHz {}, span {:.2} MHz, gain {gain}; bookmarks {})",
+        "receiver on {url} ({:.4} MHz {}, span {:.2} MHz, FFT {} (max {}), gain {gain}, radio {}; bookmarks {})",
         args.freq,
         args.mode.name(),
         rate as f64 / 1e6,
+        radio.fft(),
+        args.fft_max,
+        kinds.iter().map(|k| k.name()).collect::<Vec<_>>().join(" + "),
         args.bookmarks.display()
     );
     eprintln!("anyone who can reach that address can tune the receiver: keep it on a trusted network");
@@ -638,14 +784,25 @@ pub fn run(args: WebArgs) -> Result<()> {
         let stop = stop.clone();
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed)).context("installing Ctrl-C handler")?;
     }
-    let (tx, rx) = sync_channel::<Block>(64);
+    let (tx, rx) = sync_channel::<Capture>(64);
     let (control_tx, control_rx) = channel::<Control>();
     let reader = {
         let stop = stop.clone();
-        thread::spawn(move || dev.stream(tx, stop, Some(control_rx)))
+        let rig = Rig {
+            sources,
+            active: 0,
+            center: radio.center_hz(),
+            rate,
+            gain,
+            ppm: args.ppm,
+            sweep: None,
+            levels: radio.levels,
+            bins: radio.fft(),
+        };
+        thread::spawn(move || pump(rig, tx, stop, control_rx))
     };
 
-    serve(&mut radio, &mut bookmarks, &hub, &cmd_rx, &rx, &control_tx, speaker.as_mut(), &stop);
+    serve(&mut radio, &mut bookmarks, &hub, &cmd_rx, &rx, &control_tx, speaker.as_mut(), &stop)?;
     stop.store(true, Ordering::Relaxed);
     drop(rx);
     reader.join().map_err(|_| anyhow!("SDR reader thread panicked"))??;
@@ -660,12 +817,12 @@ fn serve(
     bookmarks: &mut Bookmarks,
     hub: &Hub,
     cmd_rx: &Receiver<Value>,
-    rx: &Receiver<Block>,
+    rx: &Receiver<Capture>,
     control_tx: &Sender<Control>,
     mut speaker: Option<&mut AudioOut>,
     stop: &AtomicBool,
-) {
-    let mut stream = AudioStream::new(radio.audio_rate());
+) -> Result<()> {
+    let mut stream = AudioStream::new()?;
     let mut audio_msgs = Vec::new();
     while !stop.load(Ordering::Relaxed) {
         for cmd in cmd_rx.try_iter() {
@@ -696,10 +853,19 @@ fn serve(
             }
         }
 
-        let block = match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(b) => b,
+        let capture = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(c) => c,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let block = match capture {
+            Capture::SweepRow(row) => {
+                if hub.clients() > 0 {
+                    hub.binary(row);
+                }
+                continue;
+            }
+            Capture::Block(block) => block,
         };
         let mut out = Output::default();
         radio.process(&block, &mut out);
@@ -707,7 +873,7 @@ fn serve(
             s.play(&out.audio);
         }
         if hub.clients() > 0 {
-            stream.set_full_rate(radio.audio_rate());
+            stream.set_mode(radio.mode)?;
             stream.push(&out.audio, &mut audio_msgs);
             for msg in audio_msgs.drain(..).chain(out.rows) {
                 hub.binary(msg);
@@ -717,11 +883,13 @@ fn serve(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clean::SAMPLE_RATE;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -732,7 +900,8 @@ mod tests {
 
     fn radio(rate: u32, mhz: f64, mode: Mode) -> Radio {
         let cfg = Wrapper::parse_from(["x"]).cfg;
-        Radio::new(rate, mhz * 1e6, mode, Gain::Manual(30.0), vec![0.0, 29.7, 32.8, 49.6], 50.0, cfg).unwrap()
+        Radio::new(rate, mhz * 1e6, mode, Gain::Manual(30.0), vec![0.0, 29.7, 32.8, 49.6], 50.0, cfg, vec![SdrKind::Rtlsdr], 2048, 8192)
+            .unwrap()
     }
 
     /// One block of u8 IQ at the radio's tuner centre with an NFM 1 kHz tone at `hz`.
@@ -817,11 +986,46 @@ mod tests {
         assert_eq!((wide, detail), (5, 5), "10 rows/s of each");
         let row = out.rows.iter().find(|m| m[0] == 2).unwrap();
         assert_eq!(u32::from_le_bytes(row[1..5].try_into().unwrap()), r.center_hz());
-        assert_eq!(u16::from_le_bytes(row[17..19].try_into().unwrap()) as usize, WIDE_BINS);
-        assert_eq!(row.len(), ROW_HEADER + adpcm::HEADER + WIDE_BINS / 2);
+        assert_eq!(u16::from_le_bytes(row[17..19].try_into().unwrap()) as usize, 2048);
+        assert_eq!(row.len(), ROW_HEADER + adpcm::HEADER + 2048 / 2);
         let tail = &out.audio[out.audio.len() / 2..];
         let rms = (tail.iter().map(|x| x * x).sum::<f32>() / tail.len() as f32).sqrt();
         assert!(rms > 0.03, "audio rms {rms}");
+    }
+
+    #[test]
+    fn fft_size_sets_the_row_width() {
+        let mut r = radio(960_000, 145.5, Mode::Nfm);
+        assert_eq!(r.state_json()["fft_sizes"], json!([512, 1024, 2048, 4096, 8192]));
+        let c = r.command(&json!({"cmd": "fft", "size": 4096})).unwrap();
+        assert!(matches!(c[..], [Control::Bins(4096)]));
+        assert!(r.command(&json!({"cmd": "fft", "size": 3000})).is_err(), "not a power of two");
+        assert!(r.command(&json!({"cmd": "fft", "size": 16384})).is_err(), "above --fft-max");
+        let mut out = Output::default();
+        r.process(&block(&r, 145.5e6, 0.3, 0.3), &mut out);
+        let bins = |out: &Output, kind: u8| {
+            let m = out.rows.iter().find(|m| m[0] == kind).unwrap();
+            u16::from_le_bytes(m[17..19].try_into().unwrap()) as usize
+        };
+        assert_eq!(bins(&out, 2), 4096);
+        // The 48 kHz channel IQ only has 4800 samples a row: the largest FFT that fits.
+        assert_eq!(bins(&out, 3), 4096);
+        r.command(&json!({"cmd": "fft", "size": 512})).unwrap();
+        out.rows.clear();
+        r.process(&block(&r, 145.5e6, 0.3, 0.3), &mut out);
+        assert_eq!((bins(&out, 2), bins(&out, 3)), (512, 512));
+    }
+
+    #[test]
+    fn fft_sizes_are_powers_of_two_up_to_the_limit() {
+        assert_eq!(fft_sizes(2048), vec![512, 1024, 2048]);
+        assert!(parse_fft("4096").is_ok());
+        assert!(parse_fft("3000").is_err());
+        assert!(parse_fft("65536").is_err());
+        assert!(parse_fft("256").is_err());
+        assert_eq!(detail_bins(8192, 48_000), 4096);
+        assert_eq!(detail_bins(8192, 240_000), 8192);
+        assert_eq!(detail_bins(1024, 48_000), 1024);
     }
 
     #[test]
@@ -888,8 +1092,8 @@ mod tests {
 
     /// Runs a recorded u8 IQ file (e.g. from `rtl_sdr`) through the web receiver and dumps
     /// raw f32 audio: the demodulator (48 kHz), after the audio chain (48 kHz), and what the
-    /// page receives: `full.f32` (PCM at `Radio::audio_rate`) and `sent.f32` (24 kHz ADPCM,
-    /// low data). For checking audio quality
+    /// page receives, decoded back from Opus: `full.f32` (`AUDIO_FULL`) and `sent.f32`
+    /// (`AUDIO_LOW`, low data). For checking audio quality
     /// offline:
     /// `SDRFUN_IQ=x.cu8 SDRFUN_IQ_CENTER=105.5e6 SDRFUN_TUNE=105.9e6 SDRFUN_MODE=wfm SDRFUN_OUT=dir
     ///  cargo test --release web::tests::dump_iq_file -- --ignored`
@@ -911,8 +1115,17 @@ mod tests {
         r.command(&json!({"cmd": "squelch", "db": null})).unwrap();
         r.command(&json!({"cmd": "cleanup", "on": false})).unwrap();
         r.center_hz = center;
-        let mut stream = AudioStream::new(r.audio_rate());
+        let mut stream = AudioStream::new().unwrap();
+        stream.set_mode(mode).unwrap();
         let (mut demod, mut chain, mut sent, mut full) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut dec_low = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+        let mut dec_full = opus::Decoder::new(48_000, opus::Channels::Mono).unwrap();
+        let mut pcm = vec![0.0f32; 2 * 960];
+        let mut decode = |dec: &mut opus::Decoder, msg: &[u8]| -> Vec<f32> {
+            let (_, cur, _) = crate::opus::split(msg).unwrap();
+            let n = dec.decode_float(cur, &mut pcm, false).unwrap();
+            pcm[..n].to_vec()
+        };
         for data in iq.chunks(16 * 16384) {
             channel.process_u8(data, &mut frames);
             demod.extend(frames.drain(..).flat_map(|f| f.audio));
@@ -923,8 +1136,8 @@ mod tests {
             stream.push(&out.audio, &mut msgs);
             for m in msgs {
                 match m[0] {
-                    AUDIO_LOW => sent.extend(adpcm::decode(&m[1..], CHUNK).iter().map(|&s| s as f32 / 32768.0)),
-                    _ => full.extend(m[5..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)),
+                    AUDIO_LOW => sent.extend(decode(&mut dec_low, &m)),
+                    _ => full.extend(decode(&mut dec_full, &m)),
                 }
             }
         }
@@ -954,12 +1167,15 @@ mod tests {
         println!("demo receiver on {url} for {secs} s");
 
         let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = sync_channel::<Block>(64);
+        let (tx, rx) = sync_channel::<Capture>(64);
         let (control_tx, control_rx) = channel::<Control>();
         let (mut center, mut rate) = (radio.center_hz(), 2_400_000u32);
         {
             let stop = stop.clone();
             thread::spawn(move || {
+                let mut sweep: Option<(u32, u32)> = None;
+                let mut bins = 2048;
+                let (mut sw_levels, mut sw_enc) = (Levels::default(), adpcm::Encoder::default());
                 // (frequency, amplitude, AM?) with a voice-ish 600 Hz + 1100 Hz tone.
                 let signals = [
                     (145.500e6, 0.05, false),
@@ -979,8 +1195,57 @@ mod tests {
                         match c {
                             Control::Center(hz) => center = hz,
                             Control::Rate(r) => rate = r,
-                            Control::Gain(_) => {}
+                            Control::Sweep(s) => sweep = s,
+                            Control::Bins(n) => bins = n,
+                            Control::Levels(v) => {
+                                sw_levels = Levels::default();
+                                if let Some((lo, hi)) = v {
+                                    sw_levels.set_manual(lo, hi);
+                                }
+                            }
+                            _ => {}
                         }
+                    }
+                    // Sweep mode: fake one hopped-FFT row per pass, no IQ and no audio.
+                    if let Some((a, b)) = sweep {
+                        let (sr, hop, nb) = SdrKind::Rtlsdr.sweep_plan();
+                        let keyed = (start.elapsed().as_secs_f64() % 5.0) < 3.0;
+                        let mut row = Vec::new();
+                        let mut covered = 0u32;
+                        while covered < b - a {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let f = a + covered + hop / 2;
+                            for j in 0..nb {
+                                let hz = f as f64 - hop as f64 / 2.0 + (j as f64 + 0.5) * hop as f64 / nb as f64;
+                                let mut db = -96.0 + (((j as u64).wrapping_mul(2654435761) >> 40) as f32 % 7.0);
+                                for (k, &(hz0, amp, _)) in signals.iter().enumerate() {
+                                    if k == 0 && !keyed {
+                                        continue;
+                                    }
+                                    if (hz - hz0).abs() < 6000.0 {
+                                        db = db.max(-52.0 + 20.0 * (amp as f32 / 0.05).log10());
+                                    }
+                                }
+                                row.push(db);
+                            }
+                            covered += hop;
+                        }
+                        if row.is_empty() {
+                            continue;
+                        }
+                        let keep = (((b - a) as f64 * nb as f64 / hop as f64) as usize).min(row.len());
+                        row.truncate(keep.max(1));
+                        let row = crate::sweep::resample(&row, crate::sweep::row_bins(row.len(), bins));
+                        let msg = crate::sweep::frame_row(
+                            ((a as u64 + b as u64) / 2) as u32, b - a, &row, &mut sw_levels, &mut sw_enc);
+                        if tx.send(Capture::SweepRow(msg)).is_err() {
+                            break;
+                        }
+                        // A real sweep of this range takes (b - a) / rate seconds.
+                        thread::sleep(Duration::from_secs_f64(((b - a) as f64 / sr as f64).max(0.2)));
+                        continue;
                     }
                     let mut data = Vec::with_capacity(2 * n);
                     for _ in 0..n {
@@ -1013,7 +1278,7 @@ mod tests {
                         data.push((127.4 + q * 128.0).round().clamp(0.0, 255.0) as u8);
                         t += 1.0 / rate as f64;
                     }
-                    if tx.send(Block { center_hz: center, rate, settings: 0, data }).is_err() {
+                    if tx.send(Capture::Block(Block { center_hz: center, rate, settings: 0, data })).is_err() {
                         break;
                     }
                     sent += n as f64 / rate as f64;
@@ -1031,7 +1296,7 @@ mod tests {
                 stop.store(true, Ordering::Relaxed);
             });
         }
-        serve(&mut radio, &mut bookmarks, &hub, &cmd_rx, &rx, &control_tx, None, &stop);
+        serve(&mut radio, &mut bookmarks, &hub, &cmd_rx, &rx, &control_tx, None, &stop).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 }
